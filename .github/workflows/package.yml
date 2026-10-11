@@ -32,6 +32,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 防御：workflow_run 触发时确保工作区同步到默认分支最新（含 VERSION 与发布脚本）。
+      # 官方行为本就检出默认分支 HEAD，此步在行为边缘差异时兜住首次发版。
+      - name: Sync to latest default branch
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
