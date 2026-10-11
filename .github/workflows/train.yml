@@ -74,6 +74,11 @@ jobs:
           pip install -r requirements.txt
           pip install gguf
 
+      - name: Offline self-test (fast sanity gate, 秒级)
+        timeout-minutes: 10
+        run: |
+          python tests/test_offline.py
+
       - name: Resume from previous successful run
         timeout-minutes: 10
         env:
