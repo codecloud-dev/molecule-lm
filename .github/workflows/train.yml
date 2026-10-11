@@ -1,13 +1,12 @@
 name: Train molecule (CPU)
 
-# 纯 CPU 训练 / 蒸馏评测 / GGUF 导出量化 全链路 CI。
-# 时间纪律（硬性，每一步都有严格时限，整链 < 6h）：
-#   - train  job：timeout-minutes 290；训练步用 `timeout 290m` + train.py --max_minutes 280 双保险。
-#   - package job：timeout-minutes 50；llama.cpp 编译 35m、imatrix 15m、量化 12m 各自独立 timeout。
-#   - release job：timeout-minutes 15。
+# 纯 CPU 训练 / 评测 全链路 CI。训练与打包分离为两个独立工作流，各自 ≤6h。
+# 时间纪律（硬性，每一步都有严格时限）：
+#   - train job：timeout-minutes 290；训练步用 `timeout 285m` + train.py --max_minutes 280 双保险。
+#   - 评测 step：timeout-minutes 20。
 # - matrix 并行对照两种数据混比（baseline vs mathcode_plus）。
-# - 跨轮续训：resume artifact 从上一成功 run 拉取并继续（软时限到点优雅保存，保证可续）。
-# - 达标（baseline 六项逐项超 SmolLM2）自动建 draft Release。
+# - 跨轮续训：resume artifact 从「最近一次 train.yml run（任意结论，只要含 resume 产物）」拉取并继续。
+# - 达标（baseline 六项逐项超 SmolLM2）由独立的 package.yml 在建 draft Release。
 # - 仅 GitHub Release，不推 HuggingFace。
 
 on:
@@ -33,12 +32,12 @@ on:
       - "NOTICE"
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
   # ----------------------------------------------------------------------
-  # 1) 训练 + 评测（matrix 对照两种数据混比，并行）
+  # 训练 + 评测（matrix 对照两种数据混比，并行）。不含打包，整条 < 6h。
   # ----------------------------------------------------------------------
   train:
     name: train-${{ matrix.variant }}
@@ -79,12 +78,13 @@ jobs:
         run: |
           python tests/test_offline.py
 
-      - name: Resume from previous successful run
+      - name: Resume from previous run (任意结论，只要有 resume 产物)
         timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_ID=$(gh run list --workflow train.yml --status success \
+          # 取最近一次 train.yml run（不限定 success，避免「训练成功但打包失败」的 run 其 resume 被丢弃）
+          RUN_ID=$(gh run list --workflow train.yml --limit 1 \
                     --json databaseId --jq '.[0].databaseId' || true)
           if [ -n "$RUN_ID" ]; then
             echo "Resuming from run $RUN_ID"
@@ -141,140 +141,3 @@ jobs:
             eval_status_${{ matrix.variant }}.json
           retention-days: 30
           if-no-files-found: warn
-
-  # ----------------------------------------------------------------------
-  # 2) 导出 GGUF + llama.cpp 量化（q8_0 / q4_K_M）+ imatrix
-  #    仅基于 baseline variant 的权重出包。
-  # ----------------------------------------------------------------------
-  package:
-    name: package-gguf
-    needs: train
-    runs-on: ubuntu-latest
-    timeout-minutes: 50
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install gguf
-
-      - name: Download baseline checkpoints + eval
-        timeout-minutes: 10
-        uses: actions/download-artifact@v4
-        with:
-          name: resume-baseline
-          path: checkpoints
-        continue-on-error: true
-
-      - name: Build calibration text (for imatrix)
-        run: |
-          python - <<'PY'
-          import sys, os
-          sys.path.insert(0, ".")
-          from seed_corpus import SEED
-          texts = []
-          for d in SEED:
-              texts.extend(SEED[d])
-          with open("data_calibration.txt", "w", encoding="utf-8") as f:
-              for t in texts:
-                  f.write(t.strip() + "\n")
-          print("calibration lines:", len(texts))
-          PY
-
-      - name: Export GGUF (f16)
-        timeout-minutes: 15
-        run: |
-          timeout 14m python export_gguf.py --ckpt checkpoints/model.safetensors \
-            --out molecule-f16.gguf
-          ls -lh molecule-f16.gguf
-
-      - name: Build llama.cpp (quantize + imatrix only)
-        timeout-minutes: 35
-        run: |
-          timeout 33m bash -c '
-          git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
-          cd llama.cpp
-          cmake -B build -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON \
-                -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target llama-quantize llama-imatrix -j 4
-          '
-
-      - name: Compute imatrix
-        timeout-minutes: 15
-        run: |
-          timeout 14m ./llama.cpp/build/bin/llama-imatrix \
-            --model molecule-f16.gguf \
-            --data data_calibration.txt \
-            --output imatrix.bin \
-            --n-gpu-layers 0 --chunk 64 || echo "imatrix skipped (non-fatal)"
-
-      - name: Quantize q8_0 and q4_K_M (with imatrix if present)
-        timeout-minutes: 15
-        run: |
-          QEXTRA=""
-          if [ -f imatrix.bin ]; then QEXTRA="--imatrix imatrix.bin"; fi
-          timeout 12m ./llama.cpp/build/bin/llama-quantize $QEXTRA \
-            molecule-f16.gguf molecule-q8_0.gguf q8_0
-          timeout 12m ./llama.cpp/build/bin/llama-quantize $QEXTRA \
-            molecule-f16.gguf molecule-q4_K_M.gguf q4_K_M
-          ls -lh molecule-*.gguf
-
-      - name: Upload GGUF artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gguf-release
-          path: |
-            molecule-f16.gguf
-            molecule-q8_0.gguf
-            molecule-q4_K_M.gguf
-            imatrix.bin
-          retention-days: 30
-          if-no-files-found: warn
-
-  # ----------------------------------------------------------------------
-  # 3) 达标（baseline 六项逐项超 SmolLM2）自动建 draft Release
-  # ----------------------------------------------------------------------
-  release:
-    name: draft-release
-    needs: package
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download baseline eval status
-        uses: actions/download-artifact@v4
-        with:
-          name: eval-baseline
-          path: eval
-        continue-on-error: true
-
-      - name: Decide & draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          STATUS="eval/eval_status_baseline.json"
-          ALL_PASS="false"
-          if [ -f "$STATUS" ]; then
-            ALL_PASS=$(python -c "import json,sys;print(json.load(open('$STATUS')).get('all_pass',False))")
-          fi
-          echo "baseline all_pass=$ALL_PASS"
-          if [ "$ALL_PASS" != "True" ]; then
-            echo "未达惊艳达标线，跳过 Release（继续续训累积 token）。"
-            exit 0
-          fi
-          TAG="v0.1.0-rc$(date +%Y%m%d)"
-          gh release create "$TAG" \
-            --draft \
-            --title "molecule v0.1 (CPU) — 惊艳达标 draft" \
-            --notes "baseline variant 六项基准逐项超越 SmolLM2-135M。见 eval_result_baseline.md。权重见 artifact gguf-release。" \
-            || echo "release already exists or failed (non-fatal)"
