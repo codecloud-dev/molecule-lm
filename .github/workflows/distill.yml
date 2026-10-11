@@ -3,7 +3,9 @@ name: Distill teacher data (CPU)
 # 多老师分领域蒸馏数据生成，纯 CPU 在 CI 内运行（5 个域 matrix 并行，各 ≤6h）。
 # 加速：actions/cache 缓存 HuggingFace 模型（避免每次重下 ~3GB）；fp32 + batch + 限线程。
 # 鲁棒：跨 run 断点续跑累积（生成前先拉取上次成功产物追加）；gated 模型需配置 secrets.HF_TOKEN。
-# 触发：push 到 main（自动开始累积）/ 手动 dispatch（可指定每域条数与软限）。
+# 触发：手动 dispatch（可指定每域条数与软限）/ 每周一定时累积。
+#   不在 push 触发——蒸馏很贵（5 域并行各 ≤6h），且产物已上传 artifact 留 90 天；
+#   训练侧 train.yml 会拉取「最近一次成功蒸馏」并入，无需每次 push 重跑。
 # 训练工作流 train.yml 会拉取「最近一次成功蒸馏」的 teacher_*.jsonl 并入训练；若蒸馏尚未产出则自动 fallback 纯种子语料。
 
 on:
@@ -17,12 +19,8 @@ on:
         description: "单域生成软时限（分钟），到点优雅停，支持续跑"
         required: false
         default: "280"
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "LICENSE"
-      - "NOTICE"
+  schedule:
+    - cron: "17 3 * * 1"   # 每周一 03:17 UTC 自动累积蒸馏数据
 
 permissions:
   contents: read

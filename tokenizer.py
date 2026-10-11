@@ -136,6 +136,16 @@ class ReducedTokenizer:
             "byte_new": self.byte_new,
         }, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False)
 
+    def _base_id_to_token(self, oid):
+        """兼容快慢两类分词器：fast 有 id_to_token 属性，slow（Qwen2Tokenizer）只有 convert_id_to_token。"""
+        fn = getattr(self.base, "convert_id_to_token", None)
+        if fn is not None and callable(fn):
+            return fn(oid)
+        fn = getattr(self.base, "id_to_token", None)
+        if fn is not None and callable(fn):
+            return fn(oid)
+        return ""
+
     def encode(self, text):
         old_ids = self.base.encode(text, add_special_tokens=False)
         out = []
@@ -144,7 +154,7 @@ class ReducedTokenizer:
                 out.append(self.old2new[oid])
             else:
                 # byte 回退：把该 piece 的字节逐字节编码
-                piece = self.base.id_to_token(oid) or ""
+                piece = self._base_id_to_token(oid) or ""
                 for b in piece.encode("utf-8", errors="replace"):
                     out.append(self.byte_new.get(b, 0))
         return out
