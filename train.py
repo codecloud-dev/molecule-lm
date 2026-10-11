@@ -22,7 +22,7 @@ from config import MoleculeConfig
 from model import MoleculeModel, count_params
 from optim import build_optimizers, build_schedulers
 from tokenizer import ReducedTokenizer, get_base_tokenizer
-from data import MixedTokenDataset, list_bins, build_seed_corpus_if_needed
+from data import MixedTokenDataset, list_bins, build_all_bins
 
 torch.set_num_threads(max(1, min(os.cpu_count() or 1, 8)))
 
@@ -105,7 +105,7 @@ def main():
     tk = build_tokenizer(cfg, args.data_dir)
     cfg.vocab_size = tk.vocab_size
     cfg.save(args.config)   # 在 vocab_size 确定后再落盘，保证续训/评测对齐
-    build_seed_corpus_if_needed(tk, args.data_dir, cfg.train_seq_len)
+    build_all_bins(tk, args.data_dir, cfg.train_seq_len)
     bins = list_bins(args.data_dir, cfg.train_seq_len)
     ratios = {
         "general": cfg.mix_general, "math": cfg.mix_math, "code": cfg.mix_code,
