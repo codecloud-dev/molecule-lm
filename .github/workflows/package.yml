@@ -3,6 +3,13 @@ name: Package & Release molecule (CPU)
 # 训练完成后独立打包：导出 GGUF(f16) → 编译 llama.cpp → imatrix → 量化 q8_0/q4_K_M。
 # 与训练工作流分离，各自 ≤6h；本工作流 timeout 240m。
 # 触发：train.yml 成功完成后自动（workflow_run）；也可手动 dispatch。
+#
+# 版本策略（用户要求）：
+#   - 每次训练成功都建立一个「真实版本」（GitHub Release，非 draft）。
+#   - 版本号由仓库根 VERSION 文件驱动，从 0.1 起逐次递增：0.1 → 0.2 → … → 0.9 → 1.0。
+#   - 封顶 V1.0：到达 1.0 后不再递增（绝不出现 1.1）；v1.0 作为「滚动最佳」反复重建。
+#   - 每次发版后回写 VERSION 并【自动触发下一代训练】以续训累积；
+#     仓库根存在 STOP_AUTOTRAIN 文件时停止自动续训（给用户一个停止开关）。
 
 on:
   workflow_run:
@@ -11,8 +18,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: read
+  contents: write        # 创建 Release + 回写 VERSION
+  actions: write         # 自动触发下一代训练工作流
 
 jobs:
   package:
@@ -46,7 +53,7 @@ jobs:
           github-token: ${{ github.token }}
         continue-on-error: true
 
-      - name: Download baseline eval status (for release gate)
+      - name: Download baseline eval status (for release notes)
         timeout-minutes: 10
         uses: actions/download-artifact@v4
         with:
@@ -134,25 +141,70 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Draft release on all_pass
-        if: always()
+      # 每次训练成功都建立一个真实版本（替代旧的「仅全过才发 draft」逻辑）。
+      # 仅当 GGUF 产出齐全才发版；发版后回写 VERSION 并自动触发下一代训练续训累积。
+      - name: Release versioned model + bump + continue
+        if: success()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-          STATUS="eval/eval_status_baseline.json"
-          ALL_PASS="false"
-          if [ -f "$STATUS" ]; then
-            ALL_PASS=$(python -c "import json,sys;print(json.load(open('$STATUS')).get('all_pass',False))")
+          set -euo pipefail
+
+          # 仅当 GGUF 产出齐全才发版，否则安全跳过（不发版、不续训）
+          for f in molecule-f16.gguf molecule-q8_0.gguf molecule-q4_K_M.gguf; do
+            if [ ! -f "$f" ]; then
+              echo "缺少 $f，跳过发版与自动续训（不继续）"
+              exit 0
+            fi
+          done
+
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          TAG="v$VERSION"
+          echo "releasing $TAG (VERSION=$VERSION)"
+
+          python make_release_notes.py
+
+          # 若标签已存在（v1.0 滚动最佳），先删后建
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "标签 $TAG 已存在（滚动最佳），删除旧 release/tag 后重建"
+            gh release delete "$TAG" -y || true
+            git push --delete origin "$TAG" >/dev/null 2>&1 || true
           fi
-          echo "baseline all_pass=$ALL_PASS"
-          if [ "$ALL_PASS" != "True" ]; then
-            echo "未达惊艳达标线，跳过 Release（继续续训累积 token）。"
-            exit 0
-          fi
-          TAG="v0.1.0-rc$(date +%Y%m%d)"
+
+          ASSETS="molecule-f16.gguf molecule-q8_0.gguf molecule-q4_K_M.gguf"
+          [ -f imatrix.bin ] && ASSETS="$ASSETS imatrix.bin"
           gh release create "$TAG" \
-            --draft \
-            --title "molecule v0.1 (CPU) — 惊艳达标 draft" \
-            --notes "baseline variant 六项基准逐项超越 SmolLM2-135M。见 eval_result_baseline.md。权重见 artifact gguf-release。" \
-            || echo "release already exists or failed (non-fatal)"
+            --title "molecule $TAG" \
+            --notes-file notes.md \
+            $ASSETS
+          echo "release $TAG 完成"
+
+          # 版本推进（封顶 1.0）
+          if [ "$MAJOR" -lt 1 ]; then
+            MINOR=$((MINOR + 1))
+            if [ "$MINOR" -gt 9 ]; then MAJOR=1; MINOR=0; fi
+            NEXT="$MAJOR.$MINOR"
+          else
+            NEXT="1.0"
+          fi
+          echo "$NEXT" > VERSION
+          echo "next VERSION=$NEXT"
+
+          # 回写 VERSION（[skip ci] 避免触发 train.yml 的 push 触发器，防止双触发）
+          if [ "$NEXT" != "$VERSION" ]; then
+            git config user.email "ci@codecloud.dev"
+            git config user.name "molecule CI"
+            git add VERSION
+            git commit -m "chore: bump version to $NEXT [skip ci]"
+            git push origin HEAD:refs/heads/main
+          fi
+
+          # 继续续训累积：存在 STOP_AUTOTRAIN 则停止
+          if [ -f STOP_AUTOTRAIN ]; then
+            echo "STOP_AUTOTRAIN 存在：不自动打下一代训练。"
+          else
+            echo "自动触发下一代训练以续训累积..."
+            gh workflow run train.yml
+          fi

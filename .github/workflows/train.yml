@@ -4,18 +4,17 @@ name: Train molecule (CPU)
 # 蒸馏数据由独立的 distill.yml 在 CI 内 CPU 生成（5 域 matrix 并行），本工作流训练前
 # 自动拉取「最近一次成功蒸馏」的 teacher_*.jsonl 并入；若蒸馏尚未产出则自动 fallback 纯种子语料。
 # 时间纪律（硬性，每一步都有严格时限）：
-#   - train job：timeout-minutes 290；训练步用 `timeout 285m` + train.py --max_minutes 280 双保险。
+#   - train job：timeout-minutes 360；训练步用 `timeout 285m` + train.py --max_minutes 280 双保险。
 #   - 评测 step：timeout-minutes 20。
-# - matrix 并行对照两种数据混比（baseline vs mathcode_plus）。
 # - 跨轮续训：resume artifact 从「最近一次 train.yml run（任意结论，只要含 resume 产物）」拉取并继续。
-# - 达标（baseline 六项逐项超 SmolLM2）由独立的 package.yml 在建 draft Release。
+# - 版本发布由独立的 package.yml 在建 GitHub Release（每次成功一个版本，VERSION 驱动，封顶 V1.0）。
 # - 仅 GitHub Release，不推 HuggingFace。
 
 on:
   workflow_dispatch:
     inputs:
       max_steps:
-        description: "每个 variant 的最大训练步数（软时限优先于它）"
+        description: "最大训练步数（软时限优先于它）"
         required: false
         default: "400"
       global_tokens:
@@ -32,6 +31,8 @@ on:
       - "**.md"
       - "LICENSE"
       - "NOTICE"
+      - "VERSION"
+      - "STOP_AUTOTRAIN"
 
 permissions:
   contents: read
@@ -39,28 +40,11 @@ permissions:
 
 jobs:
   # ----------------------------------------------------------------------
-  # 训练 + 评测（matrix 对照两种数据混比，并行）。不含打包，整条 < 6h。
+  # 训练 + 评测（单一 baseline variant，整条 < 6h，不含打包）。
   # ----------------------------------------------------------------------
   train:
-    name: train-${{ matrix.variant }}
     runs-on: ubuntu-latest
     timeout-minutes: 360          # = 6h 硬限边界（GitHub job 上限）；预算：前置40 + 训练285 + 评测20 = 345m < 360
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: baseline
-            mix_general: "0.40"
-            mix_math: "0.20"
-            mix_code: "0.20"
-            mix_reason: "0.10"
-            mix_eq: "0.10"
-          - variant: mathcode_plus   # 数学/代码加量对照
-            mix_general: "0.30"
-            mix_math: "0.25"
-            mix_code: "0.25"
-            mix_reason: "0.10"
-            mix_eq: "0.10"
     steps:
       - uses: actions/checkout@v4
 
@@ -94,7 +78,7 @@ jobs:
                     | head -1 || true)
           if [ -n "$RUN_ID" ]; then
             echo "Resuming from run $RUN_ID"
-            gh run download "$RUN_ID" --name "resume-${{ matrix.variant }}" \
+            gh run download "$RUN_ID" --name "resume-baseline" \
               --dir checkpoints || echo "no previous resume artifact"
           else
             echo "No previous completed run to resume from (训练从零开始)"
@@ -127,31 +111,31 @@ jobs:
           OMP_NUM_THREADS: "4"
         run: |
           timeout 285m python train.py \
-            --variant "${{ matrix.variant }}" \
+            --variant baseline \
             --max_steps "${{ inputs.max_steps || '400' }}" \
             --seq_len 256 \
             --global_tokens "${{ inputs.global_tokens || '16384' }}" \
             --max_minutes "${{ inputs.max_minutes || '280' }}" \
-            --mix_general "${{ matrix.mix_general }}" \
-            --mix_math "${{ matrix.mix_math }}" \
-            --mix_code "${{ matrix.mix_code }}" \
-            --mix_reason "${{ matrix.mix_reason }}" \
-            --mix_eq "${{ matrix.mix_eq }}" \
+            --mix_general "0.40" \
+            --mix_math "0.20" \
+            --mix_code "0.20" \
+            --mix_reason "0.10" \
+            --mix_eq "0.10" \
             --resume
 
       - name: Evaluate vs SmolLM2-135M
         timeout-minutes: 20
         run: |
-          timeout 18m python eval.py --out "eval_result_${{ matrix.variant }}.md"
-          mv eval_status.json "eval_status_${{ matrix.variant }}.json"
-          echo "---- eval_status_${{ matrix.variant }}.json ----"
-          cat "eval_status_${{ matrix.variant }}.json"
+          timeout 18m python eval.py --out "eval_result_baseline.md"
+          mv eval_status.json "eval_status_baseline.json"
+          echo "---- eval_status_baseline.json ----"
+          cat "eval_status_baseline.json"
 
       - name: Upload resume artifact (for next run)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: resume-${{ matrix.variant }}
+          name: resume-baseline
           path: checkpoints
           retention-days: 30
           if-no-files-found: warn
@@ -160,10 +144,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: eval-${{ matrix.variant }}
+          name: eval-baseline
           path: |
-            eval_result_${{ matrix.variant }}.md
-            eval_status_${{ matrix.variant }}.json
+            eval_result_baseline.md
+            eval_status_baseline.json
           retention-days: 30
           if-no-files-found: warn
 
@@ -171,7 +155,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: assets-${{ matrix.variant }}
+          name: assets-baseline
           path: |
             config.json
             data/tokenizer_map.json
