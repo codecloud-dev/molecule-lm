@@ -1,0 +1,19 @@
+# 训练产物（由 CI / 本地训练生成，不进仓库）
+checkpoints/
+data/
+config.json
+eval_result*.md
+eval_status*.json
+__pycache__/
+*.pyc
+
+# 推理/量化产物
+*.gguf
+imatrix.bin
+data_calibration.txt
+llama.cpp/
+
+# 系统/编辑器
+.DS_Store
+.idea/
+.vscode/

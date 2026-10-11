@@ -1,0 +1,88 @@
+molecule (开源语言模型 · 代号 molecule)
+Copyright 2024-2025 codecloud-dev
+
+This product includes software developed by codecloud-dev and components
+derived from or inspired by the following open-source works. All such
+components are themselves distributed under permissive licenses
+(Apache-2.0 / MIT). molecule itself is licensed under Apache-2.0.
+
+----------------------------------------------------------------------
+1. Tokenizer
+----------------------------------------------------------------------
+The tokenizer shipped with molecule is derived from the Qwen2.5 tokenizer
+(Qwen/Qwen2.5-0.5B), originally released by Alibaba Cloud / Qwen team under
+the Apache License 2.0.
+
+  - We reuse the Qwen2.5 tokenization scheme (vocabulary pieces, byte-level
+    fallback, special tokens, ChatML template) and then reduce the vocabulary
+    to 32K by corpus-frequency pruning. The model weights are fully
+    self-developed and not derived from Qwen2.5.
+
+  - Qwen2.5: https://github.com/QwenLM/Qwen2.5
+    License: Apache-2.0
+
+----------------------------------------------------------------------
+2. Fused architecture mechanisms (学习/融合来源，非整框架)
+----------------------------------------------------------------------
+molecule is a general decoder-only Transformer that selectively fuses
+individual open-source attention / normalization / training techniques
+rather than adopting any whole framework. Sources of inspiration include:
+
+  - RoPE (Rotary Position Embedding) + NTK-aware scaling
+      Su et al., "RoFormer" (2021); NTK-aware interpolation by bloc97 (2023).
+      Adopted from Llama / Mistral / Qwen / DeepSeek / Gemma conventions.
+
+  - GQA (Grouped-Query Attention)
+      Ainslie et al., "GQA: Training Generalized Multi-Query Transformer
+      Models from Multi-Head Checkpoints" (2023). Used by Llama-2/3, Qwen,
+      Gemma, MobileLLM.
+
+  - SwiGLU activation
+      Shazeer, "GLU Variants Improve Transformer" (2020); used by Llama /
+      Gemma / Qwen / DeepSeek. Intermediate size set to 8/3 * hidden.
+
+  - RMSNorm + Pre-Norm
+      Zhang & Sennrich, "Root Mean Square Layer Normalization" (2019);
+      standard in the Llama / Qwen / Gemma families.
+
+  - QK-Norm (normalizing Q/K before RoPE)
+      OLMo 2 (AllenAI), Gemma 3, MiniMax-M2 conventions.
+
+  - Logit soft-capping (attention 50.0 / final 30.0)
+      Gemma 2 (Gemmateam, 2024).
+
+  - DeepNorm (residual / attention gain scaling for deep narrow stacks)
+      Wang et al., "DeepNet: Scaling Transformers to 1,000 Layers" (2022);
+      used by DeepSeek.
+
+  - MTP (Multi-Token Prediction, 1 module, shared embed + output head)
+      DeepSeek-AI, "DeepSeek-V3 Technical Report" (2024).
+
+  - Tied embeddings (input = output embedding)
+      MobileLLM (Liu et al., 2024, Meta); PanGu-π conventions.
+
+  - Muon optimizer (orthogonalization of 2D weights via Newton-Schulz)
+      Jordan et al., "Muon: An optimizer for hidden layers" (2024).
+
+  - WSD (Warmup-Stable-Decay) schedule
+      Hu et al., "MiniCPM: Unveiling the Potential of Small Language Models"
+      (2024, ICLR).
+
+Each of the above techniques is a published, permissively-documented method.
+No source code from those projects is copied verbatim into molecule; the
+implementation is written independently by codecloud-dev.
+
+----------------------------------------------------------------------
+3. Distillation teachers (reference only, not redistributed)
+----------------------------------------------------------------------
+During training, molecule is distilled from open-source teacher models
+(0.5B–1.5B) using their generated text and soft labels. Teacher weights are
+NOT shipped with this repository. Teacher models and their licenses:
+
+  - Qwen2.5-0.5B-Instruct / Qwen2.5-Math-0.5B / Qwen2.5-Coder-0.5B /
+    Qwen2.5-1.5B-Instruct  — Apache-2.0 (Qwen team, Alibaba Cloud)
+  - DeepSeek-R1-Distill-Qwen-0.5B — MIT (DeepSeek-AI)
+
+----------------------------------------------------------------------
+This NOTICE file is provided for informational purposes only and does not
+modify the Apache-2.0 License under which molecule is distributed.

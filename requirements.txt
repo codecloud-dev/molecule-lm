@@ -1,0 +1,6 @@
+torch>=2.1
+transformers>=4.40
+tokenizers>=0.19
+safetensors>=0.4
+numpy>=1.24
+gradio>=4.0
