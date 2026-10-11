@@ -53,8 +53,8 @@ def load_model_tokenizer(cfg, data_dir, ckpt):
         sd = torch.load(os.path.join("checkpoints", "latest.ckpt"), map_location="cpu")
         model.load_state_dict(sd["model"])
     model.eval()
-    from transformers import AutoTokenizer
-    base = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    from tokenizer import get_base_tokenizer
+    base, _ = get_base_tokenizer(cfg.tokenizer_name)
     tk = ReducedTokenizer.load(base, os.path.join(data_dir, "tokenizer_map.json"))
     return model, tk
 

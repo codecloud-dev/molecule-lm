@@ -99,7 +99,7 @@ class Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, cfg.norm_eps)
             self.k_norm = RMSNorm(self.head_dim, cfg.norm_eps)
 
-    def forward(self, x, cos, sin, attention_mask=None):
+    def forward(self, x, cos, sin, attention_mask=None, past_kv=None):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
@@ -111,15 +111,19 @@ class Attention(nn.Module):
         # GQA：KV 头 repeat 到 Q 头数
         k = k.repeat_interleave(self.n_heads // self.n_kv, dim=1)
         v = v.repeat_interleave(self.n_heads // self.n_kv, dim=1)
+        # KV 缓存：拼接历史 K/V，避免逐 token 重算全序列
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
         # 注意力
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B,H,T,T)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B,H,T,Ttotal)
         if attention_mask is not None:
             scores = scores + attention_mask
         scores = soft_cap(scores, self.attn_cap)
         attn = torch.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)  # (B,H,T,head_dim)
         out = out.transpose(1, 2).reshape(B, T, -1)
-        return self.o_proj(out)
+        return self.o_proj(out), (k, v)
 
 
 class SwiGLU(nn.Module):
@@ -144,10 +148,11 @@ class TransformerBlock(nn.Module):
         self.attn_norm = RMSNorm(cfg.hidden_size, cfg.norm_eps)
         self.ffn_norm = RMSNorm(cfg.hidden_size, cfg.norm_eps)
 
-    def forward(self, x, cos, sin, attention_mask):
-        x = x + self.attn(self.attn_norm(x), cos, sin, attention_mask)
+    def forward(self, x, cos, sin, attention_mask, past_kv=None):
+        attn_out, kv = self.attn(self.attn_norm(x), cos, sin, attention_mask, past_kv)
+        x = x + attn_out
         x = x + self.ffn(self.ffn_norm(x))
-        return x
+        return x, kv
 
 
 class MTPModule(nn.Module):
@@ -166,7 +171,7 @@ class MTPModule(nn.Module):
         h = self.norm(x_main)
         e = self.norm_emb(emb_next)
         y = self.proj(torch.cat([h, e], dim=-1))
-        y = self.block(y, cos, sin, attn_mask)
+        y, _ = self.block(y, cos, sin, attn_mask)
         y = out_norm(y)
         return shared_lm_head(y)
 
@@ -215,7 +220,7 @@ class MoleculeModel(nn.Module):
         attn_mask = self._causal_mask(T, input_ids.device)
         x = self.embed(input_ids)
         for blk in self.blocks:
-            x = blk(x, cos, sin, attn_mask)
+            x, _ = blk(x, cos, sin, attn_mask)
         x = self.final_norm(x)
         logits = soft_cap(self.lm_head(x), self.cfg.final_logit_cap)
         out = {"logits": logits}
@@ -249,26 +254,50 @@ class MoleculeModel(nn.Module):
         sin = emb.sin().unsqueeze(1)
         return cos, sin
 
+    def forward_cached(self, input_ids, position_ids, past_kvs):
+        """带 KV 缓存的前向（供 generate 使用）：只算当前窗口，拼历史 K/V。"""
+        B, T = input_ids.shape
+        cos, sin = self._rope_cos_sin(input_ids, position_ids)
+        # 构造因果 mask：当前窗口 query 长度 T，key 长度 = 历史 + T
+        past_len = past_kvs[0][0].shape[2] if past_kvs[0] is not None else 0
+        total = past_len + T
+        full = torch.full((total, total), float("-inf"), device=input_ids.device)
+        full = torch.triu(full, diagonal=1)
+        attn_mask = full[past_len:past_len + T, 0:total].unsqueeze(0).unsqueeze(0)
+        x = self.embed(input_ids)
+        new_past = []
+        for i, blk in enumerate(self.blocks):
+            x, kv = blk(x, cos, sin, attn_mask, past_kvs[i])
+            new_past.append(kv)
+        x = self.final_norm(x)
+        logits = soft_cap(self.lm_head(x), self.cfg.final_logit_cap)
+        return logits, new_past
+
     @torch.no_grad()
     def generate(self, input_ids, max_new=64, temperature=0.9, top_p=0.9):
         self.eval()
         device = input_ids.device
         generated = input_ids.clone()
         T0 = input_ids.shape[1]
-        for _ in range(max_new):
-            out = self.forward(generated)
-            logits = out["logits"][:, -1, :] / max(temperature, 1e-5)
+        past_kvs = [None] * self.cfg.num_hidden_layers
+        pos = torch.arange(T0, device=device).unsqueeze(0)
+        # 首步：整段 prompt
+        logits, past_kvs = self.forward_cached(input_ids, pos, past_kvs)
+        for step in range(max_new):
+            last_logits = logits[:, -1, :] / max(temperature, 1e-5)
             # top-p 采样
-            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            sorted_logits, sorted_idx = torch.sort(last_logits, descending=True)
             cum = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             mask = cum > top_p
             mask[..., 1:] = mask[..., :-1].clone()
             mask[..., 0] = False
-            logits[0, sorted_idx[0, mask[0]]] = float("-inf")
-            nxt = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+            last_logits[0, sorted_idx[0, mask[0]]] = float("-inf")
+            nxt = torch.multinomial(F.softmax(last_logits, dim=-1), num_samples=1)
             generated = torch.cat([generated, nxt], dim=1)
-            if int(nxt) == self.cfg.vocab_size - 1:  # 假设末尾为 EOS
+            if int(nxt) == self.cfg.vocab_size - 1:  # 末尾 EOS
                 break
+            pos = torch.tensor([[T0 + step + 1]], device=device)
+            logits, past_kvs = self.forward_cached(nxt, pos, past_kvs)
         return generated[:, T0:]
 
 
