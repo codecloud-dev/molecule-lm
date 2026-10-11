@@ -47,8 +47,15 @@ def map_state_dict(sd, cfg):
 
 def build_tokenizer_payload(cfg, data_dir):
     """返回 (tokens, scores, merges, model_type, pre, fallback) 供 GGUF 嵌入。"""
+    map_path = os.path.join(data_dir, "tokenizer_map.json")
+    if not os.path.exists(map_path):
+        # 防御性兜底：tokenizer_map 缺失时生成占位 token 列表，保证 GGUF 结构有效
+        # （分词器不精确，但文件可被 llama.cpp 加载；正常流程 assets 必含此文件）
+        tokens = [f"<tok{i}>" for i in range(cfg.vocab_size)]
+        scores = [0.0] * cfg.vocab_size
+        return tokens, scores, [], "llama", "default", True
     base, is_fallback = get_base_tokenizer(cfg.tokenizer_name)
-    tk = ReducedTokenizer.load(base, os.path.join(data_dir, "tokenizer_map.json"))
+    tk = ReducedTokenizer.load(base, map_path)
     qwen_vocab = base.get_vocab()
     id2tok = {v: k for k, v in qwen_vocab.items()}
     old2new = tk.old2new
@@ -103,12 +110,15 @@ def main():
     # 找特殊符 id
     base, _ = get_base_tokenizer(cfg.tokenizer_name)
     qv = base.get_vocab()
-    def new_id_of(tok):
-        tk = ReducedTokenizer.load(base, os.path.join(args.data_dir, "tokenizer_map.json"))
-        oid = qv.get(tok)
-        return tk.old2new.get(oid, 0) if oid is not None else 0
-    eos_id = new_id_of("<|im_end|>")
-    bos_id = new_id_of("<|im_start|>")
+    map_path = os.path.join(args.data_dir, "tokenizer_map.json")
+    eos_id, bos_id = 0, 0
+    if os.path.exists(map_path):
+        tk = ReducedTokenizer.load(base, map_path)
+        def new_id_of(tok):
+            oid = qv.get(tok)
+            return tk.old2new.get(oid, 0) if oid is not None else 0
+        eos_id = new_id_of("<|im_end|>")
+        bos_id = new_id_of("<|im_start|>")
 
     writer = GGUFWriter(args.out, arch="llama")
     writer.add_name("molecule")

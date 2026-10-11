@@ -55,7 +55,10 @@ class MoleculeConfig:
 
     # ---- 损失 ----
     loss_hard_ce: float = 1.0
-    loss_soft_kl: float = 0.5
+    # soft KL 蒸馏系数（预留）：当前 CPU 训练管线用「生成式数据蒸馏」——
+    # distill.py 由 5 位老师按域生成高质量语料（teacher_*.jsonl），train 以 hard CE 学习。
+    # 真正的 soft-label KL 蒸馏需教师在线推理产出 soft logits，纯 CPU 不现实，列为后续 GPU 路线。
+    loss_soft_kl: float = 0.0
     loss_mtp: float = 0.1
     distill_temperature: float = 2.0
     dn_normalize: bool = True       # 域归一化，防梯度淹没

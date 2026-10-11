@@ -1,0 +1,106 @@
+name: Distill teacher data (CPU)
+
+# 多老师分领域蒸馏数据生成，纯 CPU 在 CI 内运行（5 个域 matrix 并行，各 ≤6h）。
+# 加速：actions/cache 缓存 HuggingFace 模型（避免每次重下 ~3GB）；fp32 + batch + 限线程。
+# 鲁棒：跨 run 断点续跑累积（生成前先拉取上次成功产物追加）；gated 模型需配置 secrets.HF_TOKEN。
+# 触发：push 到 main（自动开始累积）/ 手动 dispatch（可指定每域条数与软限）。
+# 训练工作流 train.yml 会拉取「最近一次成功蒸馏」的 teacher_*.jsonl 并入训练；若蒸馏尚未产出则自动 fallback 纯种子语料。
+
+on:
+  workflow_dispatch:
+    inputs:
+      n_per_domain:
+        description: "每个 domain 目标生成条数"
+        required: false
+        default: "2000"
+      max_minutes:
+        description: "单域生成软时限（分钟），到点优雅停，支持续跑"
+        required: false
+        default: "280"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - "NOTICE"
+
+permissions:
+  contents: read
+  actions: read        # 下载上次 artifact 续跑
+  id-token: write
+
+jobs:
+  distill:
+    name: distill-${{ matrix.domain }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360          # = 6h 硬限边界；预算：安装20 + 生成290 + 上传 = <360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { domain: general, model: Qwen/Qwen2.5-0.5B-Instruct }
+          - { domain: math,    model: Qwen/Qwen2.5-Math-0.5B }
+          - { domain: code,    model: Qwen/Qwen2.5-Coder-0.5B }
+          - { domain: reason,  model: deepseek-ai/DeepSeek-R1-Distill-Qwen-0.5B }
+          - { domain: eq,      model: Qwen/Qwen2.5-1.5B-Instruct }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ matrix.model }}
+          restore-keys: |
+            hf-
+
+      - name: Resume previous teacher data (跨 run 续跑累积)
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          PREV=$(gh run list --workflow distill.yml --status success --limit 1 \
+                  --json databaseId --jq '.[0].databaseId' || true)
+          if [ -n "$PREV" ] && [ "$PREV" != "${{ github.run_id }}" ]; then
+            echo "resuming distill data from run $PREV"
+            gh run download "$PREV" --name "teacher-${{ matrix.domain }}" \
+              --dir data || echo "no previous teacher-${{ matrix.domain }} artifact"
+          else
+            echo "no previous distill run to resume"
+          fi
+
+      - name: Generate teacher data (CPU, fp32, batch)
+        timeout-minutes: 300
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+          HF_HUB_DOWNLOAD_TIMEOUT: "300"
+          OMP_NUM_THREADS: "4"
+        run: |
+          set +e
+          timeout 290m python distill.py --domain "${{ matrix.domain }}" \
+            --n "${{ inputs.n_per_domain || '2000' }}" \
+            --max_new_tokens 256 --batch_size 8 \
+            --max_minutes "${{ inputs.max_minutes || '280' }}" --device cpu
+          echo "exit=$?"
+          echo "generated lines: $(wc -l < data/teacher-${{ matrix.domain }}.jsonl 2>/dev/null || echo 0)"
+
+      - name: Upload teacher data artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: teacher-${{ matrix.domain }}
+          path: data/teacher-${{ matrix.domain }}.jsonl
+          retention-days: 90
+          if-no-files-found: warn

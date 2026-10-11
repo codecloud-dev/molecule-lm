@@ -9,6 +9,8 @@
 import os
 import sys
 import json
+import ast
+import operator as _op
 import argparse
 
 import torch
@@ -29,9 +31,33 @@ TOOLS = [
     {"name": "get_time", "description": "获取当前时间", "params": {}},
     {"name": "calc", "description": "计算简单算式", "params": {"expr": "string"}},
 ]
+
+
+def _safe_calc(expr):
+    """仅允许四则运算的安全求值（无 eval、无 import，杜绝注入）。"""
+    ops = {
+        ast.Add: _op.add, ast.Sub: _op.sub, ast.Mult: _op.mul,
+        ast.Div: _op.truediv, ast.Mod: _op.mod, ast.Pow: _op.pow,
+        ast.USub: _op.neg, ast.UAdd: _op.pos,
+    }
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.BinOp):
+            return ops[type(node.op)](ev(node.left), ev(node.right))
+        if isinstance(node, ast.UnaryOp):
+            return ops[type(node.op)](ev(node.operand))
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("仅支持数字与 + - * / % ** 运算")
+
+    return ev(ast.parse(str(expr), mode="eval"))
+
+
 TOOL_IMPL = {
     "get_time": lambda args: "现在时间是本地时间。",
-    "calc": lambda args: str(eval(args.get("expr", "0"), {"__builtins__": {}}, {})),
+    "calc": lambda args: str(_safe_calc(args.get("expr", "0"))),
 }
 
 

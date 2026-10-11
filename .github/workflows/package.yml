@@ -1,7 +1,7 @@
 name: Package & Release molecule (CPU)
 
 # 训练完成后独立打包：导出 GGUF(f16) → 编译 llama.cpp → imatrix → 量化 q8_0/q4_K_M。
-# 与训练工作流分离，各自 ≤6h；本工作流 timeout 120m。
+# 与训练工作流分离，各自 ≤6h；本工作流 timeout 240m。
 # 触发：train.yml 成功完成后自动（workflow_run）；也可手动 dispatch。
 
 on:
@@ -21,7 +21,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run != null && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240          # 预算：安装20 + 下载(10x3) + 导出15 + 编译40 + imatrix15 + 量化15 = 135m；留足网络/编译波动缓冲
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +37,7 @@ jobs:
           pip install gguf
 
       - name: Download baseline checkpoints
-        timeout-minutes: 15
+        timeout-minutes: 10
         uses: actions/download-artifact@v4
         with:
           name: resume-baseline
@@ -47,7 +47,7 @@ jobs:
         continue-on-error: true
 
       - name: Download baseline eval status (for release gate)
-        timeout-minutes: 15
+        timeout-minutes: 10
         uses: actions/download-artifact@v4
         with:
           name: eval-baseline
@@ -57,7 +57,7 @@ jobs:
         continue-on-error: true
 
       - name: Download baseline model assets (config.json + tokenizer_map.json)
-        timeout-minutes: 15
+        timeout-minutes: 10
         uses: actions/download-artifact@v4
         with:
           name: assets-baseline
@@ -67,6 +67,7 @@ jobs:
         continue-on-error: true
 
       - name: Build calibration text (for imatrix)
+        timeout-minutes: 5
         run: |
           python - <<'PY'
           import sys, os
@@ -91,6 +92,7 @@ jobs:
       - name: Build llama.cpp (quantize + imatrix only)
         timeout-minutes: 40
         run: |
+          command -v cmake >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y cmake build-essential; }
           timeout 38m bash -c '
           git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
           cd llama.cpp

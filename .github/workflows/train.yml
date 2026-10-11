@@ -1,6 +1,8 @@
 name: Train molecule (CPU)
 
 # 纯 CPU 训练 / 评测 全链路 CI。训练与打包分离为两个独立工作流，各自 ≤6h。
+# 蒸馏数据由独立的 distill.yml 在 CI 内 CPU 生成（5 域 matrix 并行），本工作流训练前
+# 自动拉取「最近一次成功蒸馏」的 teacher_*.jsonl 并入；若蒸馏尚未产出则自动 fallback 纯种子语料。
 # 时间纪律（硬性，每一步都有严格时限）：
 #   - train job：timeout-minutes 290；训练步用 `timeout 285m` + train.py --max_minutes 280 双保险。
 #   - 评测 step：timeout-minutes 20。
@@ -42,7 +44,7 @@ jobs:
   train:
     name: train-${{ matrix.variant }}
     runs-on: ubuntu-latest
-    timeout-minutes: 290          # 硬上限 < 6h 窗口
+    timeout-minutes: 360          # = 6h 硬限边界（GitHub job 上限）；预算：前置40 + 训练285 + 评测20 = 345m < 360
     strategy:
       fail-fast: false
       matrix:
@@ -93,6 +95,25 @@ jobs:
           else
             echo "No previous run to resume from"
           fi
+
+      - name: Download distilled teacher data (最新成功蒸馏，可选)
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          DRUN=$(gh run list --workflow distill.yml --status success --limit 1 \
+                  --json databaseId --jq '.[0].databaseId' || true)
+          if [ -n "$DRUN" ]; then
+            echo "using distilled data from run $DRUN"
+            for d in general math code reason eq; do
+              gh run download "$DRUN" --name "teacher-$d" --dir data \
+                || echo "no teacher-$d artifact (fallback to seed corpus)"
+            done
+          else
+            echo "no distill run yet -> 纯种子语料训练（build_all_bins 自动 fallback）"
+          fi
+          ls -la data/ 2>/dev/null || true
 
       - name: Train (CPU, 软时限双保险)
         timeout-minutes: 290
