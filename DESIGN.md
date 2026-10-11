@@ -3,7 +3,7 @@
 > **开源名**：`molecule` · **开源版本**：`v0.1` · **内部项目名**：分子模型开源版 · **内部版本**：`v31`
 > **许可证**：Apache-2.0 · **公开仓库**：`codecloud-dev/molecule-lm` · **训练**：GitHub Actions 纯 CPU，单轮 ≤6h
 > 本文件是「从训练到部署」全部 25 轮讨论的锁死决策留档，也是实现 / CI 的施工蓝图。任何改动需回到这里对齐。
-> 模型身份（固定不可改）：**开源语言模型 · 代号 molecule · 由 codecloud-dev 独立开发（codecloud-dev 是它的开发者/家人）**。不写版本号、不写 MoleculeOS。
+> 模型身份（固定不可改）：**开源语言模型 · 代号 molecule · 由 codecloud-dev 独立开发（codecloud-dev 是它的开发者/家人）**。不写版本号，不写任何公司或操作系统相关内容。
 
 ---
 
@@ -127,7 +127,7 @@
 ---
 
 ## 8. 身份与治理
-- **身份（固定不可改）**：开源语言模型 · 代号 molecule · 由 codecloud-dev 独立开发（codecloud-dev 是它的开发者/家人）。语气/措辞/细节自由，但不得否认这几条。不写版本号、不写 MoleculeOS。
+- **身份（固定不可改）**：开源语言模型 · 代号 molecule · 由 codecloud-dev 独立开发（codecloud-dev 是它的开发者/家人）。语气/措辞/细节自由，但不得否认这几条。不写版本号，不写任何公司或操作系统相关内容。
 - **许可证**：Apache-2.0；`LICENSE` 注明融合来源（RoPE/GQA/SwiGLU/MTP 等）+ `NOTICE` 文件列 Qwen2.5 tokenizer 归属（Apache-2.0）。
 - **文档**：README / 模型卡中英文双语、中文优先。
 - **版本号**：权重 `v0.1.0` 起始，每轮续训递增补丁号（v0.1.1, v0.1.2…）。

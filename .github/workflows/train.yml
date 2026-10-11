@@ -1,9 +1,12 @@
 name: Train molecule (CPU)
 
 # 纯 CPU 训练 / 蒸馏评测 / GGUF 导出量化 全链路 CI。
+# 时间纪律（硬性，每一步都有严格时限，整链 < 6h）：
+#   - train  job：timeout-minutes 290；训练步用 `timeout 290m` + train.py --max_minutes 280 双保险。
+#   - package job：timeout-minutes 50；llama.cpp 编译 35m、imatrix 15m、量化 12m 各自独立 timeout。
+#   - release job：timeout-minutes 15。
 # - matrix 并行对照两种数据混比（baseline vs mathcode_plus）。
-# - 单轮 ≤ 6h（timeout-minutes 留余量到 350）。
-# - 跨轮续训：resume artifact 从上一成功 run 拉取并继续。
+# - 跨轮续训：resume artifact 从上一成功 run 拉取并继续（软时限到点优雅保存，保证可续）。
 # - 达标（baseline 六项逐项超 SmolLM2）自动建 draft Release。
 # - 仅 GitHub Release，不推 HuggingFace。
 
@@ -11,13 +14,17 @@ on:
   workflow_dispatch:
     inputs:
       max_steps:
-        description: "每个 variant 的最大训练步数"
+        description: "每个 variant 的最大训练步数（软时限优先于它）"
         required: false
-        default: "300"
+        default: "400"
       global_tokens:
         description: "目标 global batch（token 数）；越小越快"
         required: false
-        default: "32768"
+        default: "16384"
+      max_minutes:
+        description: "单 variant 训练软时限（分钟），到点优雅停止并保存"
+        required: false
+        default: "280"
   push:
     branches: [main]
     paths-ignore:
@@ -31,12 +38,12 @@ permissions:
 
 jobs:
   # ----------------------------------------------------------------------
-  # 1) 训练 + 评测（matrix 对照两种数据混比）
+  # 1) 训练 + 评测（matrix 对照两种数据混比，并行）
   # ----------------------------------------------------------------------
   train:
     name: train-${{ matrix.variant }}
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # ~5.8h，< 6h 硬限
+    timeout-minutes: 290          # 硬上限 < 6h 窗口
     strategy:
       fail-fast: false
       matrix:
@@ -61,12 +68,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        timeout-minutes: 20
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install gguf
 
       - name: Resume from previous successful run
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -80,16 +89,18 @@ jobs:
             echo "No previous run to resume from"
           fi
 
-      - name: Train (CPU)
+      - name: Train (CPU, 软时限双保险)
+        timeout-minutes: 290
         env:
           HF_HUB_DISABLE_TELEMETRY: "1"
           HF_HUB_DOWNLOAD_TIMEOUT: "120"
           OMP_NUM_THREADS: "4"
         run: |
-          python train.py \
+          timeout 285m python train.py \
             --variant "${{ matrix.variant }}" \
-            --max_steps "${{ inputs.max_steps || '300' }}" \
-            --global_tokens "${{ inputs.global_tokens || '32768' }}" \
+            --max_steps "${{ inputs.max_steps || '400' }}" \
+            --global_tokens "${{ inputs.global_tokens || '16384' }}" \
+            --max_minutes "${{ inputs.max_minutes || '280' }}" \
             --mix_general "${{ matrix.mix_general }}" \
             --mix_math "${{ matrix.mix_math }}" \
             --mix_code "${{ matrix.mix_code }}" \
@@ -98,13 +109,15 @@ jobs:
             --resume
 
       - name: Evaluate vs SmolLM2-135M
+        timeout-minutes: 20
         run: |
-          python eval.py --out "eval_result_${{ matrix.variant }}.md"
+          timeout 18m python eval.py --out "eval_result_${{ matrix.variant }}.md"
           mv eval_status.json "eval_status_${{ matrix.variant }}.json"
           echo "---- eval_status_${{ matrix.variant }}.json ----"
           cat "eval_status_${{ matrix.variant }}.json"
 
       - name: Upload resume artifact (for next run)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: resume-${{ matrix.variant }}
@@ -113,6 +126,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload eval artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eval-${{ matrix.variant }}
@@ -130,7 +144,7 @@ jobs:
     name: package-gguf
     needs: train
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
 
@@ -139,12 +153,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        timeout-minutes: 20
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install gguf
 
       - name: Download baseline checkpoints + eval
+        timeout-minutes: 10
         uses: actions/download-artifact@v4
         with:
           name: resume-baseline
@@ -167,38 +183,45 @@ jobs:
           PY
 
       - name: Export GGUF (f16)
+        timeout-minutes: 15
         run: |
-          python export_gguf.py --ckpt checkpoints/model.safetensors \
+          timeout 14m python export_gguf.py --ckpt checkpoints/model.safetensors \
             --out molecule-f16.gguf
           ls -lh molecule-f16.gguf
 
       - name: Build llama.cpp (quantize + imatrix only)
+        timeout-minutes: 35
         run: |
+          timeout 33m bash -c '
           git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
           cd llama.cpp
           cmake -B build -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON \
                 -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target llama-quantize llama-imatrix -j 4
+          '
 
       - name: Compute imatrix
+        timeout-minutes: 15
         run: |
-          ./llama.cpp/build/bin/llama-imatrix \
+          timeout 14m ./llama.cpp/build/bin/llama-imatrix \
             --model molecule-f16.gguf \
             --data data_calibration.txt \
             --output imatrix.bin \
             --n-gpu-layers 0 --chunk 64 || echo "imatrix skipped (non-fatal)"
 
       - name: Quantize q8_0 and q4_K_M (with imatrix if present)
+        timeout-minutes: 15
         run: |
           QEXTRA=""
           if [ -f imatrix.bin ]; then QEXTRA="--imatrix imatrix.bin"; fi
-          ./llama.cpp/build/bin/llama-quantize $QEXTRA \
+          timeout 12m ./llama.cpp/build/bin/llama-quantize $QEXTRA \
             molecule-f16.gguf molecule-q8_0.gguf q8_0
-          ./llama.cpp/build/bin/llama-quantize $QEXTRA \
+          timeout 12m ./llama.cpp/build/bin/llama-quantize $QEXTRA \
             molecule-f16.gguf molecule-q4_K_M.gguf q4_K_M
           ls -lh molecule-*.gguf
 
       - name: Upload GGUF artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gguf-release
@@ -217,7 +240,7 @@ jobs:
     name: draft-release
     needs: package
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

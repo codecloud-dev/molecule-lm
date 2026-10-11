@@ -67,6 +67,8 @@ def main():
     ap.add_argument("--data_dir", default="data")
     ap.add_argument("--out_dir", default="checkpoints")
     ap.add_argument("--max_steps", type=int, default=2000)
+    ap.add_argument("--max_minutes", type=float, default=None,
+                    help="训练软时限（分钟）：到点即停并保存，保证单轮 CI ≤6h。None=不限时。")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seq_len", type=int, default=None)
     ap.add_argument("--global_tokens", type=int, default=None)
@@ -135,6 +137,10 @@ def main():
     model.train()
     t0 = time.time()
     while step < args.max_steps:
+        # 软时限：到点即停并保存，配合 job 硬超时保证单轮 CI ≤6h
+        if args.max_minutes is not None and (time.time() - t0) / 60.0 >= args.max_minutes:
+            print(f"[time] 达到 --max_minutes={args.max_minutes}，提前停止于 step={step}", flush=True)
+            break
         # 混合精度
         with torch.autocast(device_type="cpu", dtype=dtype, enabled=use_bf16):
             total_loss = 0.0
