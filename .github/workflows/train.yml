@@ -141,3 +141,14 @@ jobs:
             eval_status_${{ matrix.variant }}.json
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Upload model assets (config.json + tokenizer_map.json, 供打包)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.variant }}
+          path: |
+            config.json
+            data/tokenizer_map.json
+          retention-days: 30
+          if-no-files-found: warn

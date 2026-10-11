@@ -56,6 +56,16 @@ jobs:
           github-token: ${{ github.token }}
         continue-on-error: true
 
+      - name: Download baseline model assets (config.json + tokenizer_map.json)
+        timeout-minutes: 15
+        uses: actions/download-artifact@v4
+        with:
+          name: assets-baseline
+          path: .
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+
       - name: Build calibration text (for imatrix)
         run: |
           python - <<'PY'
