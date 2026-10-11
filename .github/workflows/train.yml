@@ -80,20 +80,24 @@ jobs:
         run: |
           python tests/test_offline.py
 
-      - name: Resume from previous run (任意结论，只要有 resume 产物)
+      - name: Resume from previous run (已完成 run，排除自身)
         timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 取最近一次 train.yml run（不限定 success，避免「训练成功但打包失败」的 run 其 resume 被丢弃）
-          RUN_ID=$(gh run list --workflow train.yml --limit 1 \
-                    --json databaseId --jq '.[0].databaseId' || true)
+          # 取最近一次「已完成」的 train.yml run，且排除当前 run（gh run list 会把自身排第一）。
+          # 不限定 success：避免「训练成功但打包失败」的 run 其 resume 被丢弃。
+          RUN_ID=$(gh run list --workflow train.yml \
+                    --status success,failure,cancelled --limit 10 \
+                    --json databaseId --jq \
+                    '.[] | select(.databaseId != ${{ github.run_id }}) | .databaseId' \
+                    | head -1 || true)
           if [ -n "$RUN_ID" ]; then
             echo "Resuming from run $RUN_ID"
             gh run download "$RUN_ID" --name "resume-${{ matrix.variant }}" \
               --dir checkpoints || echo "no previous resume artifact"
           else
-            echo "No previous run to resume from"
+            echo "No previous completed run to resume from (训练从零开始)"
           fi
 
       - name: Download distilled teacher data (最新成功蒸馏，可选)
