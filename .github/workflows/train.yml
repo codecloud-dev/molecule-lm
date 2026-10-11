@@ -99,6 +99,7 @@ jobs:
           timeout 285m python train.py \
             --variant "${{ matrix.variant }}" \
             --max_steps "${{ inputs.max_steps || '400' }}" \
+            --seq_len 256 \
             --global_tokens "${{ inputs.global_tokens || '16384' }}" \
             --max_minutes "${{ inputs.max_minutes || '280' }}" \
             --mix_general "${{ matrix.mix_general }}" \

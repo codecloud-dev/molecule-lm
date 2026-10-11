@@ -132,6 +132,11 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     micro_bs = 4  # CPU 安全 microbatch；梯度累积到 global_tokens_per_step
+    # 防御性：长序列时自动减小 micro_bs，避免激活内存溢出（7GB Runner / 8GB 沙箱）
+    if cfg.train_seq_len >= 1024:
+        micro_bs = 1
+    elif cfg.train_seq_len >= 512:
+        micro_bs = 2
     accum = max(1, cfg.global_tokens_per_step // (micro_bs * cfg.train_seq_len))
 
     model.train()

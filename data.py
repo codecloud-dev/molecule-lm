@@ -22,10 +22,18 @@ def pack_tokens(tokens, seq_len):
     return arr[:n].reshape(-1, seq_len)
 
 
-def build_domain_bin(tk, texts, seq_len, out_path):
+def build_domain_bin(tk, texts, seq_len, out_path, min_seqs=4):
     ids = []
     for t in texts:
         ids.extend(tk.encode(t))
+    if not ids:
+        return 0
+    # 兜底：首轮小语料可能凑不出 seq_len 段，循环补齐到至少 min_seqs 段，
+    # 保证 bin 非真空（否则 MixedTokenDataset 对空文件 mmap 会崩）。
+    target = seq_len * min_seqs
+    if len(ids) < target:
+        ids = ids * (target // len(ids) + 1)
+        ids = ids[:target]
     arr = pack_tokens(ids, seq_len)
     arr.tofile(out_path)
     return arr.shape[0]
