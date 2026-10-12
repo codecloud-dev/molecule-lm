@@ -64,8 +64,9 @@ jobs:
           for rid in $(gh run list --workflow "Train molecule (CPU)" \
                         --status completed --limit 20 \
                         --json databaseId --jq '.[].databaseId'); do
-            if gh run view "$rid" --json artifacts --jq '.artifacts[].name' \
-                 2>/dev/null | grep -qx resume-baseline; then
+            # 用 gh api 查 artifact 名列表（gh run view 不支持 artifacts 字段），不下载。
+            if timeout 30 gh api "repos/$GITHUB_REPOSITORY/actions/runs/$rid/artifacts" \
+                 --jq '.artifacts[].name' 2>/dev/null | grep -qx resume-baseline; then
               RID="$rid"
               echo "found resume in run $rid"
               break
