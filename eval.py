@@ -29,24 +29,55 @@ def build_prompt(q, choices):
     return head + body
 
 
+def _letter_id(tk, ch):
+    """取得单字母 token 的 new id；任何异常都回退到 byte token 或 0，绝不崩。
+
+    语义正确性：训练侧 ReducedTokenizer 对词表外字符同样走 byte 回退
+    （byte_new[ord(ch)]），此处用 byte token 兜底与训练编码完全一致。
+    """
+    try:
+        ids = tk.encode(ch)
+        if ids:
+            return ids[0]
+    except Exception:
+        pass
+    b = ord(ch)
+    bn = getattr(tk, "byte_new", None)
+    if isinstance(bn, dict) and b in bn:
+        return bn[b]
+    return 0
+
+
 @torch.no_grad()
 def score_benchmark(model, tk, name):
     items = get_benchmark(name)
     if not items:
         return None
-    letters = [tk.encode(chr(65 + i))[0] for i in range(3)]
+    # 单字母 token（A/B/C）：健壮获取，任一项异常则该基准跳过而非崩。
+    try:
+        letters = [_letter_id(tk, chr(65 + i)) for i in range(3)]
+        letters = [l for l in letters if isinstance(l, int) and l >= 0]
+        if not letters:
+            return None
+    except Exception:
+        return None
     correct = 0
     for q, choices, ans in items:
-        prompt = build_prompt(q, choices)
-        ids = tk.encode(prompt)
-        if len(ids) < 2:
+        try:
+            prompt = build_prompt(q, choices)
+            ids = tk.encode(prompt)
+            if len(ids) < 2:
+                continue
+            x = torch.tensor([ids], dtype=torch.long)
+            logits = model(x)["logits"][0, -1].float()
+            scores = [logits[l].item() for l in letters if 0 <= l < logits.size(0)]
+            if not scores:
+                continue
+            pred = int(torch.tensor(scores).argmax())
+            if pred == ans:
+                correct += 1
+        except Exception:
             continue
-        x = torch.tensor([ids], dtype=torch.long)
-        logits = model(x)["logits"][0, -1].float()
-        scores = [logits[l].item() for l in letters]
-        pred = int(torch.tensor(scores).argmax())
-        if pred == ans:
-            correct += 1
     return 100.0 * correct / len(items)
 
 

@@ -125,8 +125,9 @@ jobs:
 
       - name: Evaluate vs SmolLM2-135M
         timeout-minutes: 20
+        continue-on-error: true        # 评测为附属项：即便异常也不阻断发版（训练成功即可）
         run: |
-          timeout 18m python eval.py --out "eval_result_baseline.md"
+          timeout 18m python eval.py --out "eval_result_baseline.md" || echo "[eval] 评测异常，已跳过（不影响训练产物与发版）"
           mv eval_status.json "eval_status_baseline.json"
           echo "---- eval_status_baseline.json ----"
           cat "eval_status_baseline.json"

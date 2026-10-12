@@ -50,13 +50,39 @@ jobs:
           pip install -r requirements.txt
           pip install gguf
 
+      # 独立查找最近一次 completed 的 train run 并取其 resume 检查点：
+      #   - 不依赖 github.event.workflow_run.id（train 因评测偶发异常被判 failure 时
+      #     不会自动触发，但仍可手动 dispatch 打包已训好的 checkpoint）；
+      #   - 手动 dispatch 也能正确定位最近的训练产物。
+      - name: Find latest train run with resume artifact
+        id: find
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RID=""
+          for rid in $(gh run list --workflow "Train molecule (CPU)" \
+                        --status completed --limit 20 \
+                        --json databaseId --jq '.[].databaseId'); do
+            if gh run view "$rid" --json artifacts --jq '.artifacts[].name' \
+                 2>/dev/null | grep -qx resume-baseline; then
+              RID="$rid"
+              echo "found resume in run $rid"
+              break
+            fi
+          done
+          echo "run_id=$RID" >> "$GITHUB_OUTPUT"
+          if [ -z "$RID" ]; then
+            echo "⚠️ 未找到任何含 resume-baseline 的 train run"
+          fi
+
       - name: Download baseline checkpoints
         timeout-minutes: 10
         uses: actions/download-artifact@v4
         with:
           name: resume-baseline
           path: checkpoints
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.find.outputs.run_id }}
           github-token: ${{ github.token }}
         continue-on-error: true
 
@@ -66,7 +92,7 @@ jobs:
         with:
           name: eval-baseline
           path: eval
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.find.outputs.run_id }}
           github-token: ${{ github.token }}
         continue-on-error: true
 
@@ -76,7 +102,7 @@ jobs:
         with:
           name: assets-baseline
           path: .
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.find.outputs.run_id }}
           github-token: ${{ github.token }}
         continue-on-error: true
 
