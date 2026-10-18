@@ -104,6 +104,7 @@ python llama.cpp/convert_hf_to_gguf.py hf_model --outfile molecule-f16.gguf
 - **封顶 V1.0**：到达 `1.0` 后不再递增（绝不出现 1.1）；`v1.0` 作为「滚动最佳」反复重建。
 - 每个版本附带：`molecule-f16.gguf` / `molecule-q8_0.gguf` / `molecule-q4_K_M.gguf` + 当版评测说明。
 - 发版后自动触发下一代训练以**续训累积**；仓库根放 `STOP_AUTOTRAIN` 文件即停止自动续训。
+- 每个版本的评测与版本说明**同时写入仓库**（不只 GitHub Release）：`releases/vX.Y.md`（版本说明）+ `benchmarks/vX.Y.json`（当版评测趋势，含生成式/代码能力及格结果），可在仓库内直接查阅历史版本数据。
 
 ---
 
@@ -112,7 +113,6 @@ python llama.cpp/convert_hf_to_gguf.py hf_model --outfile molecule-f16.gguf
 - [DESIGN.md](./DESIGN.md)：架构与训练设计的实现蓝图（融合来源、数据、蒸馏、部署）。
 - [MODEL_CARD.md](./MODEL_CARD.md)：模型卡（架构/数据/评测/局限/透明声明）。
 - [NOTICE](./NOTICE)：融合来源与 Qwen2.5 分词器归属。
-- [PITFALLS.md](./PITFALLS.md)：开发踩坑日记（CI / 代码 gotcha，动手前必读）。
 
 ## 许可证
 

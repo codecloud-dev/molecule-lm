@@ -215,6 +215,13 @@ jobs:
             $ASSETS
           echo "release $TAG 完成"
 
+          # 入库：版本说明 + 评测数据写进仓库（不只 GitHub Release）
+          mkdir -p releases benchmarks
+          cp notes.md "releases/${TAG}.md"
+          if [ -f eval/eval_status_baseline.json ]; then
+            cp eval/eval_status_baseline.json "benchmarks/${TAG}.json"
+          fi
+
           # 版本推进（封顶 1.0）
           if [ "$MAJOR" -lt 1 ]; then
             MINOR=$((MINOR + 1))
@@ -223,15 +230,22 @@ jobs:
           else
             NEXT="1.0"
           fi
-          echo "$NEXT" > VERSION
           echo "next VERSION=$NEXT"
 
-          # 回写 VERSION（[skip ci] 避免触发 train.yml 的 push 触发器，防止双触发）
+          # 回写版本数据 + VERSION（[skip ci] 避免触发 train.yml 的 push 触发器）
+          git config user.email "ci@codecloud.dev"
+          git config user.name "molecule CI"
+          git add releases benchmarks
+          MSG="data: release ${TAG} notes + benchmarks"
           if [ "$NEXT" != "$VERSION" ]; then
-            git config user.email "ci@codecloud.dev"
-            git config user.name "molecule CI"
+            echo "$NEXT" > VERSION
             git add VERSION
-            git commit -m "chore: bump version to $NEXT [skip ci]"
+            MSG="data: release ${TAG} + bump version to $NEXT"
+          fi
+          if git diff --cached --quiet; then
+            echo "无新版本数据可提交，跳过 commit"
+          else
+            git commit -m "$MSG [skip ci]"
             git push origin HEAD:refs/heads/main
           fi
 
