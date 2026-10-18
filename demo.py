@@ -11,8 +11,6 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import MoleculeConfig
-from model import MoleculeModel
-from tokenizer import ReducedTokenizer
 from generate import SYS_IDENTITY, load_model_tokenizer, build_messages, generate_text, maybe_tool, TOOL_IMPL
 
 
