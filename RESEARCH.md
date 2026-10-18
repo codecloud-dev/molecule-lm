@@ -28,7 +28,7 @@
 | 目录拆分 | `train.py` `eval.py` `model.py` `distill.py` `tokenizer.py` 已按职责拆分 | 已基本对齐 | 保持，新增代码仍按职责落位 |
 | 能力边界 | `MODEL_CARD` / `DESIGN` 已诚实声明局限 | 已较好 | 维持诚实，新增能力即补局限 |
 | 弱设备定位 | 已定「弱设备可跑、体积小、可移植优先」，GGUF 量化已落地 | 已对齐 SmolLM2 强项 | README 显式给出体积/内存 |
-| 版本数据 | 每版落 `releases/vX.Y.md` + `benchmarks/vX.Y.json` | 已超越多数小项目 | 维持，release 页附链接 |
+| 版本数据 | 每版落 `releases/vX.Y.md` + `benchmarks/vX.Y.json` | 已覆盖多数小项目未做的落库 | 维持，release 页附链接 |
 | 双语 | 当前仅中文 README | 差于 Qwen 实践 | 后续补 `README_EN.md`（非当前重点） |
 
 ## 4. 结论（落地优先级）
