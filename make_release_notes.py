@@ -8,7 +8,7 @@ VERSION = open("VERSION").read().strip()
 TAG = "v" + VERSION
 
 # 固定身份句：不写版本号、不写公司
-IDENTITY = "开源语言模型·代号 molecule·由 codecloud-dev 独立开发（开发者/家人）"
+IDENTITY = "开源语言模型·代号 molecule·由 codecloud-dev 独立开发"
 
 eval_note = "（暂无评测产物）"
 p = "eval/eval_status_baseline.json"
@@ -37,7 +37,7 @@ notes = f"""# molecule {TAG}
 - **能力**：支持工具调用。
 
 ### 诚实现状
-早期累积版本，训练算力有限（纯 CPU、单次 ≤6h），与 SmolLM2-135M 等成熟小模型相比仍有差距，随续训累积持续提升。{eval_note}
+早期累积版本，训练算力有限（纯 CPU、单次 ≤6h），与成熟小模型相比仍有差距，随续训累积持续提升。{eval_note}
 
 ### 权重
 - `molecule-q4_K_M.gguf`（推荐，体积小、够用）

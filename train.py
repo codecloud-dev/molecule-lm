@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""molecule V0.1 训练主脚本（纯 CPU，单轮 ≤6h，支持跨轮续训）。
+"""molecule 训练主脚本（纯 CPU，单轮 ≤6h，支持跨轮续训）。
 
 - 自动探测 bf16（支持才用，否则 fp32）。
 - 存全量续训态：model + Muon/AdamW optimizer + step + 数据游标 + RNG 种子。
-- 分域加权（DN-lite）：数学/代码/推理/EQ 等少数域损失加权，防被通用域淹没。
-- 周期性跑轻量评测；结束存 safetensors 供导出。
+- 数据按领域配比混合采样实现域平衡；结束存 safetensors 供导出。
 """
 
 import os
@@ -53,12 +52,6 @@ def build_tokenizer(cfg, data_dir):
     )
     print(f"[tok] built reduced vocab size={tk.vocab_size}")
     return tk
-
-
-def domain_weight(domain, cfg):
-    # DN-lite：少数域（数学/代码/推理/EQ）相对通用域加权，防淹没
-    base = {"general": 1.0, "math": 1.5, "code": 1.5, "reason": 1.5, "eq": 1.3}
-    return base.get(domain, 1.0)
 
 
 def main():

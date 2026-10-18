@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""molecule V0.1 评测：zero-shot logprob 选 A/B/C + 与 SmolLM2-135M 硬靶对比。
+"""molecule 评测：zero-shot logprob 选 A/B/C（趋势参考，非官方分数）。
 
-- 用内置精简基准（自包含）；如需官方 dev 全集，替换 benchmarks 即可。
-- 输出：stdout 打印 + 写 eval_result.md 对比表。
-- 达标：六项基准逐项超 SmolLM2(±0.5) 即视为“惊艳达标”。
+- 用内置精简冒烟集（自包含，详见 benchmarks.py 声明）；如需官方 split 请接入 harness。
+- 输出：stdout 打印 + 写 eval_result.md 趋势表。
+- 说明：内置冒烟集为自写题，仅用于训练趋势监控，不与外模型官方分数比较。
 """
 
 import os
@@ -104,7 +104,7 @@ def main():
     model.eval()
 
     rows = []
-    print("\n=== molecule V0.1 评测 vs SmolLM2-135M ===")
+    print("\n=== molecule 评测（内置冒烟集，趋势参考，非官方分数）===")
     all_pass = True
     for name in cfg.eval_benchmarks:
         acc = score_benchmark(model, tk, name)
@@ -114,16 +114,17 @@ def main():
         ok = acc >= target - cfg.eval_tolerance
         all_pass = all_pass and ok
         rows.append((name, acc, target, ok))
-        print(f"{name:12s} our={acc:5.1f}  smol={target:5.1f}  {'PASS' if ok else 'FAIL'}")
+        print(f"{name:12s} our={acc:5.1f}  ref={target:5.1f}  {'≥ref' if ok else '<?ref'}")
 
-    # 写对比表
-    md = ["# molecule V0.1 评测对比表", "",
-          "| 基准 | molecule(我们) | SmolLM2-135M | 达标(±0.5) |",
+    # 写趋势表（中性：仅展示自测分数与参考值，不做跨模型胜负判定）
+    md = ["# molecule 评测趋势表（内置冒烟集，非官方 split）", "",
+          "| 冒烟集 | molecule(自测) | 参考值 | 备注 |",
           "| --- | --- | --- | --- |"]
     for name, acc, target, ok in rows:
-        md.append(f"| {name} | {acc:.1f} | {target:.1f} | {'✅' if ok else '❌'} |")
+        md.append(f"| {name} | {acc:.1f} | {target:.1f} | {'≥ref' if ok else '<?ref'} |")
     md.append("")
-    md.append(f"**结论**：{'全部逐项超越 SmolLM2（惊艳达标）🎉' if all_pass else '尚未全部超越，继续续训/扩充数据'}")
+    md.append("> 说明：本表为自写冒烟题，仅作训练趋势监控；参考值取自公开模型公开数字，")
+    md.append("> **不可直接比较**，正式评测请接入 lm-evaluation-harness + 官方 split。")
     open(args.out, "w", encoding="utf-8").write("\n".join(md))
     print(f"\n[write] {args.out}")
     with open("eval_status.json", "w") as f:

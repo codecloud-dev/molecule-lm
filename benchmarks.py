@@ -1,8 +1,12 @@
 """内置精简基准集（自包含，CI 不依赖下载）。
 
-覆盖：hellaswag / arc / piqa / mmlu / winogrande / triviaqa / cmmlu / ceval。
-每项含少量代表性 MCQ（question + choices + answer_index）。
-正式评测可替换为官方 dev 全集；此处用于趋势对比 + 自包含必绿。
+⚠️ 诚实声明：本文件是**少量自写 MCQ 冒烟题**，**不是** HellaSwag / ARC / MMLU /
+CMMLU / C-Eval 等官方基准的正式 split。结果**仅用于训练趋势监控**，
+**不可与外模型官方分数直接比较**，也不得用于商业宣传中的跨模型对比。
+
+覆盖：hellaswag / arc / piqa / mmlu / winogrande / triviaqa / cmmlu / ceval
+（中文两类 cmmlu/ceval 为自写常识题）。每项含少量代表性 MCQ。
+正式评测请接入 lm-evaluation-harness + 各基准官方 split。
 """
 
 BENCH = {}

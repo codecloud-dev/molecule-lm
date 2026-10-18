@@ -1,6 +1,6 @@
-"""Molecule V0.1 配置：架构 + 训练 + 数据 + 蒸馏 + 评测。
+"""molecule 配置：架构 + 训练 + 数据 + 蒸馏 + 评测。
 
-所有超参来自 DESIGN.md（25 轮讨论锁死）。改这里必须回 DESIGN.md 对齐。
+超参与实现以 DESIGN.md 为蓝图。改这里需回 DESIGN.md 对齐。
 """
 
 from dataclasses import dataclass, field, asdict
@@ -86,7 +86,7 @@ class MoleculeConfig:
         "hellaswag", "arc", "piqa", "mmlu", "winogrande", "triviaqa",
         "cmmlu", "ceval",
     ])
-    # SmolLM2-135M 官方零样本硬靶（逐项超 +0.5）
+    # 参考对照值（仅趋势参考，非官方跨模型对比；来源为公开模型公开数字）
     smollm2_targets: dict = field(default_factory=lambda: {
         "hellaswag": 68.4, "arc": 43.9, "piqa": 68.4, "mmlu": 31.5,
         "winogrande": 51.3, "triviaqa": 4.1, "cmmlu": 0.0, "ceval": 0.0,
@@ -97,10 +97,9 @@ class MoleculeConfig:
     export_quant: list = field(default_factory=lambda: ["q8_0", "q4_K_M"])
     use_imatrix: bool = True
 
-    # ---- 身份（固定不可改）----
+    # ---- 身份（开发者署名，如实标注）----
     identity_fixed: str = (
-        "开源语言模型，代号 molecule，由 codecloud-dev 独立开发"
-        "（codecloud-dev 是它的开发者/家人）。"
+        "开源语言模型，代号 molecule，由 codecloud-dev 独立开发。"
     )
 
     # ---- 版本 ----

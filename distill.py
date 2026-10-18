@@ -9,7 +9,8 @@
     * batch 生成（默认 8）+ 限定 OMP/线程数，吃满 runner 的 CPU。
     * HuggingFace 模型目录由 CI 的 actions/cache 缓存，避免每次重下。
 - 鲁棒性：断点续跑（已存在且达标则跳过）、设备选择、离线 dry-run 校验、
-    gated 模型下载失败给出清晰提示（需配置 secrets.HF_TOKEN 且该账号已同意模型协议）。
+    下载失败给出清晰提示（教师均为开源许可 Apache-2.0/MIT，无需 HF_TOKEN；
+    失败多为 CI 联网访问 HuggingFace 受限，请检查网络/镜像）。
 
 用法：
   python distill.py --dry_run --all                  # 离线校验教师映射/路由/提示，不下载模型
@@ -82,12 +83,12 @@ def gen(domain, n, cfg, out_path, device="cpu", max_new_tokens=256,
         ).to(device)
     except Exception as e:
         msg = str(e)
-        if "401" in msg or "gated" in msg.lower() or "authenticated" in msg.lower():
-            print("=" * 60)
-            print(f"[distill][FATAL] 无法下载教师模型 {model_name}（疑似 gated 鉴权失败）。")
-            print("  解决：在仓库 Settings > Secrets 配置 HF_TOKEN（需为该账号已同意")
-            print("        此模型协议的 HuggingFace 访问令牌），或改用非 gated 模型。")
-            print("=" * 60)
+        print("=" * 60)
+        print(f"[distill][FATAL] 无法加载教师模型 {model_name}。")
+        print("  教师均为开源许可（Apache-2.0 / MIT），无需 HF_TOKEN。")
+        print("  常见原因：CI 联网访问 HuggingFace 受限（网络/镜像问题）。")
+        print(f"  原始错误：{msg[:300]}")
+        print("=" * 60)
         raise
     model.eval()
 

@@ -123,7 +123,7 @@ jobs:
             --mix_eq "0.10" \
             --resume
 
-      - name: Evaluate vs SmolLM2-135M
+      - name: 模型冒烟评测（趋势监控）
         timeout-minutes: 20
         continue-on-error: true        # 评测为附属项：即便异常也不阻断发版（训练成功即可）
         run: |

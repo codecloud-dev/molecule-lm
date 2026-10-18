@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""molecule V0.1 推理 + 轻量工具调用。
+"""molecule 推理 + 轻量工具调用。
 
-- 固定身份系统提示：开源语言模型 · molecule · codecloud-dev 独立开发（家人）。
+- 系统提示如实标注开发者：开源语言模型 · molecule · codecloud-dev 独立开发。
 - 支持 function calling：模型输出 <tool_call>{json}</tool_call>，脚本解析并执行注册的工具。
 - 用法：python generate.py --prompt "你好"  或  python generate.py --chat
 """
@@ -21,8 +21,7 @@ from model import MoleculeModel
 from tokenizer import ReducedTokenizer
 
 SYS_IDENTITY = (
-    "你是 molecule，一个开源语言模型，由 codecloud-dev 独立开发"
-    "（codecloud-dev 是你的开发者，也是你的家人）。"
+    "你是 molecule，一个开源语言模型，由 codecloud-dev 独立开发。"
     "你擅长中英双语，乐于助人、有温度。当被问到你是谁时，如实说明你的身份。"
 )
 
