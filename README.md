@@ -53,21 +53,48 @@ molecule 的目标很单纯：**让一个能跑 llama.cpp 的弱设备（手机�
 
 ---
 
-## 快速开始
+## 快速开始（弱设备 / 手机 / 树莓派 · 3 步跑起来）
+
+molecule 的目标就是让 llama.cpp 能跑的弱设备**纯本地对话**。发布版已带 GGUF，无需训练、无需联网、无需 GPU。
+
+```bash
+# 0) 装一个 llama.cpp 运行环境（任选其一）
+pip install llama-cpp-python                 # 纯 Python 推理
+# 或编译 ggml-org/llama.cpp，得到 llama-cli / llama-server
+
+# 1) 取一个发布版 GGUF（GitHub Releases，推荐 q4_K_M，约 0.08GB）
+#    文件名形如 molecule-q4_K_M.gguf
+
+# 2) 直接对话（纯本地、不联网）
+llama-cli -m molecule-q4_K_M.gguf -p "你好，介绍一下你自己"
+#    或起服务：llama-server -m molecule-q4_K_M.gguf
+```
+
+体积与内存（0.1B 级 + GQA 3:1 + 绑定嵌入；推理内存含权重的近似，KV 缓存随长度另计）：
+
+| 形态 | 文件大小 | 推理内存（约） |
+| --- | --- | --- |
+| 导出原精度（fp32） | ~0.5 GB | ~0.55 GB |
+| q8_0 | ~0.14 GB | ~0.15 GB |
+| **q4_K_M（推荐）** | **~0.08 GB** | **~0.1 GB** |
+
+> 中低端手机 / 树莓派 CPU 单线程即可本地对话，断网可用。
+
+## 从零训练 / 本地开发
 
 ```bash
 pip install -r requirements.txt
 
-# 1) 训练（纯 CPU；首轮用内置种子语料，保证自包含必绿；可跨轮续训）
+# 训练（纯 CPU；首轮用内置种子语料，自包含必绿；可跨轮续训）
 python train.py --max_steps 400 --seq_len 256 --resume
 
-# 2) 评测（轻量自建冒烟集，趋势参考，非官方分数）
+# 评测（轻量自建冒烟集，趋势参考，非官方分数）
 python eval.py
 
-# 3) 导出 HF 模型目录（供 llama.cpp 转换）
+# 导出 GGUF（弱设备加载用）；离线需先设：HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 python export_gguf.py
 
-# 4) 推理 / 对话 / 工具调用
+# 推理 / 对话 / 工具调用
 python generate.py --prompt "你好，你是谁？"
 python generate.py --chat
 python demo.py          # Gradio 网页对话
@@ -78,11 +105,16 @@ python demo.py          # Gradio 网页对话
 ## 部署（好部署）
 
 ```bash
-# 导出后由 llama.cpp 转换并量化（CI 自动完成）
-git clone https://github.com/ggml-org/llama.cpp
-python llama.cpp/convert_hf_to_gguf.py hf_model --outfile molecule-f16.gguf
-./llama.cpp/llama-quantize molecule-f16.gguf molecule-q4_K_M.gguf q4_K_M
-./llama.cpp/llama-server -m molecule-q4_K_M.gguf
+# 1) 导出 GGUF（export_gguf.py 直接产出 llama.cpp 可加载文件，无需经 HF 中转）
+python export_gguf.py --ckpt checkpoints/model.safetensors --out molecule-f16.gguf
+#    离线需先设：HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+# 2) 量化（编译 ggml-org/llama.cpp 得到 llama-quantize；或 llama-cpp-python 的量化工具）
+llama-quantize molecule-f16.gguf molecule-q4_K_M.gguf q4_K_M
+
+# 3) 运行（纯本地、不联网）
+llama-cli  -m molecule-q4_K_M.gguf -p "你好"
+llama-server -m molecule-q4_K_M.gguf
 ```
 
 产出：`safetensors` + `q8_0` + `q4_K_M`（~0.1GB，CPU/手机可跑）+ `imatrix` 提升 q4 质量。

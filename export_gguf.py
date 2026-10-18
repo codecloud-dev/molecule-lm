@@ -10,6 +10,10 @@
 
 用法：
   python export_gguf.py --ckpt checkpoints/model.safetensors --out molecule-f16.gguf
+
+离线说明：无网环境下需先设离线开关，让分词器下载立即失败并走 byte 兜底，
+避免无网挂起（联网环境无需设置）：
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python export_gguf.py ...
 """
 
 import os
