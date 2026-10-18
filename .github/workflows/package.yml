@@ -2,7 +2,8 @@ name: Package & Release molecule (CPU)
 
 # 训练完成后独立打包：导出 GGUF(f16) → 编译 llama.cpp → imatrix → 量化 q8_0/q4_K_M。
 # 与训练工作流分离，各自 ≤6h；本工作流 timeout 240m。
-# 触发：train.yml 成功完成后自动（workflow_run）；也可手动 dispatch。
+# 触发：由 train.yml 训练成功后显式 gh workflow run 触发；也可手动 dispatch。
+# 续训链为「显式互触发」：train 成功→本工作流发版→本工作流显式触发下一轮 train，闭环续训累积。
 #
 # 版本策略（用户要求）：
 #   - 每次训练成功都建立一个「真实版本」（GitHub Release，非 draft）。
@@ -12,9 +13,6 @@ name: Package & Release molecule (CPU)
 #     仓库根存在 STOP_AUTOTRAIN 文件时停止自动续训（给用户一个停止开关）。
 
 on:
-  workflow_run:
-    workflows: ["Train molecule (CPU)"]
-    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -23,10 +21,8 @@ permissions:
 
 jobs:
   package:
-    # 仅当手动触发，或上游 train 成功时才打包（train 失败则不浪费打包算力）
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run != null && github.event.workflow_run.conclusion == 'success')
+    # 仅当手动触发，或由 train.yml 训练成功后显式 gh workflow run 触发时才打包
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 240          # 预算：安装20 + 下载(10x3) + 导出15 + 编译40 + imatrix15 + 量化15 = 135m；留足网络/编译波动缓冲
     steps:

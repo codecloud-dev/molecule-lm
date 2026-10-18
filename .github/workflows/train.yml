@@ -36,7 +36,7 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 jobs:
   # ----------------------------------------------------------------------
@@ -162,3 +162,13 @@ jobs:
             data/tokenizer_map.json
           retention-days: 30
           if-no-files-found: warn
+
+      # 续训链：train 成功 → 显式触发 package.yml 发版（替代不可靠的 workflow_run）。
+      # package.yml 成功后又会显式触发下一轮 train，形成「显式互触发」的续训累积闭环。
+      - name: 训练成功 → 显式触发打包发版
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "train 成功，显式触发 package.yml 发版（续训链：显式互触发）"
+          gh workflow run package.yml
