@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import argparse
+import re
 
 import torch
 
@@ -81,6 +82,97 @@ def score_benchmark(model, tk, name):
     return 100.0 * correct / len(items)
 
 
+# ---- 生成式评测：要求模型中英各答一句，查讲话有无问题 ----
+_GEN_SYS = "你是 molecule，一个开源语言模型，由 codecloud-dev 独立开发，擅长中英双语。"
+
+
+def _has_chinese(text):
+    return any("\u4e00" <= c <= "\u9fff" for c in text)
+
+
+def _has_latin_alpha(text):
+    return any(c.isascii() and c.isalpha() for c in text)
+
+
+@torch.no_grad()
+def eval_generative(model, tk, max_new=140, temperature=0.9, top_p=0.9):
+    user = "请用一句话用中文回答，再用一句话用英文回答：什么是人工智能？"
+    prompt = ("<|im_start|>system\n" + _GEN_SYS + "<|im_end|>\n"
+              "<|im_start|>user\n" + user + "<|im_end|>\n"
+              "<|im_start|>assistant\n")
+    ids = tk.encode(prompt)
+    x = torch.tensor([ids], dtype=torch.long)
+    out = model.generate(x, max_new=max_new, temperature=temperature, top_p=top_p)
+    text = tk.decode(out[0].tolist())
+    words = text.split()
+    n = max(len(words), 1)
+    rep = max((text.count(w) for w in set(words)), default=0)
+    degenerate = (len(text) < 12) or (rep / n > 0.6)
+    problems = []
+    if not _has_chinese(text):
+        problems.append("缺中文")
+    if not _has_latin_alpha(text):
+        problems.append("缺英文")
+    if degenerate:
+        problems.append("疑似重复/过短")
+    return {"text": text[:400], "ok": not problems, "problems": problems}
+
+
+# ---- 代码能力评测：及格线（add 函数基础用例），不搞全能 ----
+_CODE_SYS = "你是 molecule，一个开源语言模型，由 codecloud-dev 独立开发。只输出 Python 代码，不要解释。"
+
+
+def _extract_code(text):
+    m = re.search(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    i = text.find("def ")
+    if i >= 0:
+        return text[i:].strip()
+    return text.strip()
+
+
+def _safe_run_code(code, fn_name, tests):
+    safe_builtins = {
+        "len": len, "range": range, "int": int, "float": float, "str": str,
+        "list": list, "dict": dict, "set": set, "tuple": tuple, "bool": bool,
+        "abs": abs, "min": min, "max": max, "sum": sum, "enumerate": enumerate,
+        "zip": zip, "sorted": sorted, "round": round, "pow": pow, "map": map,
+        "filter": filter, "any": any, "all": all, "True": True, "False": False,
+        "None": None,
+    }
+    ns = {}
+    try:
+        exec(compile(code, "<gen>", "exec"), {"__builtins__": safe_builtins}, ns)
+    except Exception:
+        return False, "编译/执行失败"
+    fn = ns.get(fn_name)
+    if not callable(fn):
+        return False, f"未定义函数 {fn_name}"
+    for args, expected in tests:
+        try:
+            if fn(*args) != expected:
+                return False, f"{fn_name}{args} 期望 {expected}"
+        except Exception:
+            return False, f"{fn_name}{args} 运行报错"
+    return True, "通过"
+
+
+@torch.no_grad()
+def eval_code(model, tk, max_new=220, temperature=0.8, top_p=0.9):
+    user = "写一个 Python 函数 add(a, b)，返回 a 与 b 的和。只输出代码。"
+    prompt = ("<|im_start|>system\n" + _CODE_SYS + "<|im_end|>\n"
+              "<|im_start|>user\n" + user + "<|im_end|>\n"
+              "<|im_start|>assistant\n")
+    ids = tk.encode(prompt)
+    x = torch.tensor([ids], dtype=torch.long)
+    out = model.generate(x, max_new=max_new, temperature=temperature, top_p=top_p)
+    text = tk.decode(out[0].tolist())
+    code = _extract_code(text)
+    ok, detail = _safe_run_code(code, "add", [((2, 3), 5), ((-1, 1), 0), ((0, 0), 0)])
+    return {"text": text[:400], "code": code[:300], "ok": ok, "detail": detail}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.json")
@@ -116,6 +208,18 @@ def main():
         rows.append((name, acc, target, ok))
         print(f"{name:12s} our={acc:5.1f}  ref={target:5.1f}  {'≥ref' if ok else '<?ref'}")
 
+    # 生成式评测（中英各一句，查讲话有无问题）+ 代码能力评测（及格线）
+    try:
+        gen = eval_generative(model, tk)
+    except Exception as e:
+        gen = {"text": "", "ok": False, "problems": [f"error: {e}"]}
+    try:
+        code_eval = eval_code(model, tk)
+    except Exception as e:
+        code_eval = {"ok": False, "detail": f"error: {e}"}
+    print(f"[gen] 中英各一句 ok={gen['ok']} problems={gen.get('problems')}")
+    print(f"[code] add 及格 ok={code_eval['ok']} detail={code_eval.get('detail')}")
+
     # 写趋势表（中性：仅展示自测分数与参考值，不做跨模型胜负判定）
     md = ["# molecule 评测趋势表（内置冒烟集，非官方 split）", "",
           "| 冒烟集 | molecule(自测) | 参考值 | 备注 |",
@@ -125,10 +229,24 @@ def main():
     md.append("")
     md.append("> 说明：本表为自写冒烟题，仅作训练趋势监控；参考值取自公开模型公开数字，")
     md.append("> **不可直接比较**，正式评测请接入 lm-evaluation-harness + 官方 split。")
+    md.append("")
+    md.append("## 生成式评测（中英各一句 · 查讲话有无问题）")
+    md.append(f"- 结果：**{'通过' if gen['ok'] else '未通过'}**  "
+              f"{'；'.join(gen.get('problems', [])) or '中英文齐备、无异常重复'}")
+    md.append(f"- 模型输出（节选）：{gen.get('text', '').replace(chr(10), ' ')}")
+    md.append("")
+    md.append("## 代码能力评测（及格线 · add 函数基础用例）")
+    md.append(f"- 结果：**{'通过' if code_eval['ok'] else '未通过'}**  {code_eval.get('detail', '')}")
+    md.append(f"- 模型输出（节选）：{code_eval.get('text', '').replace(chr(10), ' ')}")
     open(args.out, "w", encoding="utf-8").write("\n".join(md))
     print(f"\n[write] {args.out}")
     with open("eval_status.json", "w") as f:
-        json.dump({"all_pass": all_pass, "rows": rows}, f)
+        json.dump({
+            "all_pass": all_pass,
+            "rows": rows,
+            "gen_ok": bool(gen["ok"]),
+            "code_ok": bool(code_eval["ok"]),
+        }, f)
 
 
 if __name__ == "__main__":
