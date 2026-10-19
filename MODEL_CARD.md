@@ -11,6 +11,8 @@ language:
 > **仓库**：[codecloud-dev/molecule-lm](https://github.com/codecloud-dev/molecule-lm)
 > **当前版本**：见仓库 `VERSION` 文件与各 GitHub Release 标签（从 `v0.1` 起，封顶 `V1.0`）
 
+**开源语言模型·代号 molecule·由 codecloud-dev 独立开发**
+
 ## 模型简介
 
 molecule 是一个 **0.1B 级（约 129M 参数）** 的轻量开源语言模型，主打**在资源受限的设备上本地运行**。它体积小、完全开源、不依赖任何外部服务，主要面向**中文对话与轻量文本生成**场景——手机、树莓派、老旧 / 低配 CPU 都能跑。

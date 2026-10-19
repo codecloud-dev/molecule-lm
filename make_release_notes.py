@@ -7,7 +7,7 @@ import os
 VERSION = open("VERSION").read().strip()
 TAG = "v" + VERSION
 
-# 固定身份句：不写版本号、不写公司
+# 固定身份句：不写版本号、不写开发主体信息
 IDENTITY = "开源语言模型·代号 molecule·由 codecloud-dev 独立开发"
 
 eval_note = "（暂无评测产物）"
