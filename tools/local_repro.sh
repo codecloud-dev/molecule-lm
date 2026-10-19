@@ -4,11 +4,10 @@
 # 用法：
 #   bash tools/local_repro.sh
 #
-# 它会跑 tests/test_offline.py，覆盖四个关键正确性点（约几秒）：
-#   1. 模型前向：logits 形状正确且数值有限（含 MTP）。
-#   2. 字节级兜底分词器：中英文/emoji 往返一致（离线无需下载 Qwen）。
-#   3. 空 bin 兜底：小语料也能产出非空 .bin（防首轮 mmap 崩溃）。
-#   4. KV 缓存生成：forward_cached 首步与全量前向一致。
+# 它会跑三个离线自测，全程确定性离线（HF_HUB_OFFLINE=1 防止联网挂起），约几秒：
+#   tests/test_offline.py            模型前向 / 字节级分词中英文往返 / KV 缓存一致性
+#   tests/test_export_gguf.py        离线导出合法 GGUF（llama.cpp 可加载）—— 弱设备可跑前提
+#   tests/test_generate_offline.py   离线聊天路径（build_messages -> generate_text）—— 无网也能推理
 #
 # 目的：改完代码先本地秒级验证，别把每个小改动丢进 6h CI 试错（见 PITFALLS.md 铁律 1）。
 #
@@ -19,12 +18,23 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-echo "===== molecule 本地离线自测 tests/test_offline.py ====="
-python3 tests/test_offline.py
-rc=$?
-if [ $rc -ne 0 ]; then
-  echo "离线自测失败（rc=$rc），请先排查再提交/推送。"
-  exit $rc
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+fail=0
+for t in tests/test_offline.py tests/test_export_gguf.py tests/test_generate_offline.py; do
+  echo "===== $t ====="
+  python3 "$t"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "✗ $t 失败（rc=$rc）"
+    fail=1
+  fi
+  echo
+done
+
+if [ $fail -ne 0 ]; then
+  echo "本地复现（离线自测）存在失败，请先排查再提交/推送。"
+  exit 1
 fi
-echo
-echo "本地复现（离线自测）通过 ✓  改完代码再进 6h CI。"
+echo "本地复现（离线自测全过）✓  改完代码再进 6h CI。"

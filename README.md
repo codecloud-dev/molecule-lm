@@ -1,5 +1,7 @@
 # molecule
 
+[![Tests (offline)](https://github.com/codecloud-dev/molecule-lm/actions/workflows/tests.yml/badge.svg)](https://github.com/codecloud-dev/molecule-lm/actions/workflows/tests.yml)
+
 > **开源名**：`molecule` · **许可证**：Apache-2.0 · **训练**：GitHub Actions 纯 CPU，单轮 ≤6h、可跨轮续训
 > **开发者**：由 codecloud-dev 独立开发、开源
 > **定位**：一个 **0.1B 级、纯 CPU 可训、极小体积、好部署、开源**的自研小模型。
