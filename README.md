@@ -138,6 +138,11 @@ llama-server -m molecule-q4_K_M.gguf
 - **封顶 V1.0**：到达 `1.0` 后不再递增（绝不出现 1.1）；`v1.0` 作为「滚动最佳」反复重建。
 - 每个版本附带：`molecule-f16.gguf` / `molecule-q8_0.gguf` / `molecule-q4_K_M.gguf` + 当版评测说明。
 - 发版后自动触发下一代训练以**续训累积**；仓库根放 `STOP_AUTOTRAIN` 文件即停止自动续训。
+
+> **何时结束**：续训链**不会自动终止**——它会一直滚动 v1.0 累积训练（CI 7×24 运行，消耗 Actions 额度）。要停下来，在仓库根放一个空文件 `STOP_AUTOTRAIN` 并提交即可（下一轮打包时发现它就不会再触发训练）。想「停在最好的 1.0」，就让它跑到 `1.0` 再放开关：
+> ```bash
+> touch STOP_AUTOTRAIN && git add STOP_AUTOTRAIN && git commit -m "stop autotrain" && git push
+> ```
 - 每个版本的评测与版本说明**同时写入仓库**（不只 GitHub Release）：`releases/vX.Y.md`（版本说明）+ `benchmarks/vX.Y.json`（当版评测趋势，含生成式/代码能力及格结果），可在仓库内直接查阅历史版本数据。
 
 ---
