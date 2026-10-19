@@ -25,14 +25,6 @@ on:
         description: "单 variant 训练软时限（分钟），到点优雅停止并保存"
         required: false
         default: "280"
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "LICENSE"
-      - "NOTICE"
-      - "VERSION"
-      - "STOP_AUTOTRAIN"
 
 permissions:
   contents: read
