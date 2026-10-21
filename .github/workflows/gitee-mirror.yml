@@ -1,0 +1,33 @@
+name: 镜像到 Gitee（单向，GitHub 为唯一主源）
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 */6 * * *'   # 每 6 小时兜底，防 push 触发的同步失败漏同步
+  workflow_dispatch:        # 允许手动触发补同步
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # 全量历史，标签也要同步
+
+      # ⚠️ 不用 --mirror：GitHub 的 refs/pull/* 会被 Gitee 当隐藏引用拒绝
+      #    （deny updating a hidden ref），显式同步 heads+tags。
+      # ⚠️ token 不走 remote URL（防日志泄露），走 http.extraheader。
+      - name: 单向镜像到 Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: thousand-code-crafts/${{ github.event.repository.name }}
+        run: |
+          if [ -z "$GITEE_TOKEN" ]; then
+            echo "::error::未配置 GITEE_TOKEN secret，跳过镜像（请在仓库 Settings → Secrets 配置）"
+            exit 1
+          fi
+          git remote add gitee "https://gitee.com/${GITEE_REPO}.git"
+          git config --local "http.https://gitee.com/.extraheader" \
+            "Authorization: Basic $(printf 'thousand-code-crafts:%s' "$GITEE_TOKEN" | base64 -w0)"
+          git push --prune gitee "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
+          echo "镜像完成：$(git rev-parse --short HEAD) → gitee.com/${GITEE_REPO}"
