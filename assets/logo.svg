@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="MoX">
+  <defs>
+    <linearGradient id="moxg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5eead4"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+    <radialGradient id="moxsheen" cx="0.32" cy="0.24" r="0.85">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.5"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- 液态玻璃方：MoX 系列品牌色（青绿 → 靛紫），承官网既有渐变 -->
+  <rect x="3" y="3" width="58" height="58" rx="17" fill="url(#moxg)"/>
+  <rect x="3" y="3" width="58" height="58" rx="17" fill="url(#moxsheen)"/>
+  <!-- M：粗圆头笔画，终端窗口的字母化身 -->
+  <path d="M15 45 V23 L29 36.5 L43 23 V45" fill="none" stroke="#0b0d12" stroke-width="6.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 块光标：贴在 M 右侧的实心白块——终端 blinking cursor，亦是 X 的交叉意象 -->
+  <rect x="43.5" y="33.5" width="6" height="11" rx="1.6" fill="#ffffff"/>
+</svg>
