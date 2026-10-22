@@ -50,7 +50,15 @@ def map_state_dict(sd, cfg):
 
 
 def build_tokenizer_payload(cfg, data_dir):
-    """返回 (tokens, scores, merges, model_type, pre, fallback) 供 GGUF 嵌入。"""
+    """返回 (tokens, scores, merges, model_type, pre, fallback) 供 GGUF 嵌入。
+
+    关键修复（molecule 发布 GGUF 词表损坏事件）：
+    必须使用与训练*完全一致*的基础分词器（Qwen2），并直接借助
+    ReducedTokenizer.new2old 映射从基础分词器取真实 token 字符串。
+    若基础分词器降级为 ByteLevelTok 兜底，则明确报错——否则会静默把
+    全部 token 写成占位符，导致生成的 GGUF 分词器彻底损坏
+    （llama.cpp 严格校验 abort 且生成不可读）。
+    """
     map_path = os.path.join(data_dir, "tokenizer_map.json")
     if not os.path.exists(map_path):
         # 防御性兜底：tokenizer_map 缺失时生成占位 token 列表，保证 GGUF 结构有效
@@ -59,20 +67,27 @@ def build_tokenizer_payload(cfg, data_dir):
         scores = [0.0] * cfg.vocab_size
         return tokens, scores, [], "llama", "default", True
     base, is_fallback = get_base_tokenizer(cfg.tokenizer_name)
+    if is_fallback:
+        raise RuntimeError(
+            "导出时基础分词器降级为 ByteLevelTok 兜底，无法获得 Qwen2 真实 token 字符串，"
+            "会导致 GGUF 词表全部写成占位符而损坏。请保证导出环境能联网加载 Qwen2 分词器后再导出。"
+        )
     tk = ReducedTokenizer.load(base, map_path)
-    qwen_vocab = base.get_vocab()
-    id2tok = {v: k for k, v in qwen_vocab.items()}
-    old2new = tk.old2new
     tokens = [None] * tk.vocab_size
-    for old, nid in old2new.items():
-        tokens[nid] = id2tok.get(old, "<unk>")
-    # 保证每个位置都有字符串
+    for nid in range(tk.vocab_size):
+        old = tk.new2old.get(nid)
+        if old is None:
+            tokens[nid] = f"<tok{nid}>"
+            continue
+        s = tk._base_id_to_token(old)
+        tokens[nid] = s if s else f"<tok{nid}>"
+    # 保证每个位置都有字符串（不应有 None）
     for i in range(tk.vocab_size):
         if tokens[i] is None:
             tokens[i] = f"<tok{i}>"
     scores = [0.0] * tk.vocab_size
     merges = []
-    if not is_fallback and hasattr(base, "save_pretrained"):
+    if hasattr(base, "save_pretrained"):
         try:
             import tempfile
             tmp = tempfile.mkdtemp()
@@ -89,8 +104,8 @@ def build_tokenizer_payload(cfg, data_dir):
         except Exception as e:
             print(f"[export] 合并对提取失败（{e}），仅写 token 列表。")
     model_type = "llama"
-    pre = "qwen2" if not is_fallback else "default"
-    return tokens, scores, merges, model_type, pre, is_fallback
+    pre = "qwen2"
+    return tokens, scores, merges, model_type, pre, False
 
 
 def main():
