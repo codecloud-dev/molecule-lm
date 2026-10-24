@@ -7,7 +7,7 @@ name: Train molecule (CPU)
 #   - train job：timeout-minutes 360；训练步用 `timeout 285m` + train.py --max_minutes 280 双保险。
 #   - 评测 step：timeout-minutes 20。
 # - 跨轮续训：resume artifact 从「最近一次 train.yml run（任意结论，只要含 resume 产物）」拉取并继续。
-# - 版本发布由独立的 package.yml 在建 GitHub Release（每次成功一个版本，VERSION 驱动，封顶 V1.0）。
+# - 版本发布由独立的 package.yml 在建 GitHub Release（每次成功一个版本，VERSION 驱动，封顶 V2.0 滚动最佳）。
 # - 仅 GitHub Release，不推 HuggingFace。
 
 on:
@@ -144,14 +144,14 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Upload model assets (config.json + tokenizer_map.json, 供打包)
+      - name: Upload model assets (config.json + 自研词表 self_vocab.json, 供打包)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: assets-baseline
           path: |
             config.json
-            data/tokenizer_map.json
+            data/self_vocab.json
           retention-days: 30
           if-no-files-found: warn
 

@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-"""把 molecule V0.1 权重导出为自写 GGUF（llama.cpp 可直接加载/量化）。
+"""把 molecule 权重导出为自写 GGUF（llama.cpp 可直接加载/量化）。
 
 - 权重名映射到 Llama 命名（token_embd / blk.N / output）；绑定嵌入：output = token_embd。
 - 元数据：层数 / 维度 / 头 / KV 头 / vocab / RoPE / 软封顶 等全部写入。
-- 分词器：在线时从 Qwen2.5 tokenizer.json 裁剪到我们的 32K 子集（保留 byte/特殊符）
-  嵌入 GGUF；离线兜底时写入 byte-level token 列表，保证文件结构有效。
+- 分词器：v2.0 起直接嵌入自研字表（data/self_vocab.json，零外部依赖），
+  含 256 个 <0xXX> 字节回退，tokenizer.ggml.pre 设为 "default"，任意字符均可正确编码。
 - 注：QK-Norm / MTP 为训练期稳定与密度技巧，llama.cpp 推理按标准 Llama 近似；
-  0.1B 量级影响极小，v0.1 可接受。
+  0.1B 量级影响极小，可接受。
 
 用法：
   python export_gguf.py --ckpt checkpoints/model.safetensors --out molecule-f16.gguf
-
-离线说明：无网环境下需先设离线开关，让分词器下载立即失败并走 byte 兜底，
-避免无网挂起（联网环境无需设置）：
-  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python export_gguf.py ...
 """
 
 import os
@@ -26,7 +22,6 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import MoleculeConfig
 from model import MoleculeModel
-from tokenizer import ReducedTokenizer, get_base_tokenizer
 from gguf import GGUFWriter
 
 
@@ -50,61 +45,27 @@ def map_state_dict(sd, cfg):
 
 
 def build_tokenizer_payload(cfg, data_dir):
-    """返回 (tokens, scores, merges, model_type, pre, fallback) 供 GGUF 嵌入。
+    """v2.0 起直接嵌入自研字表（零 Qwen 依赖），返回 (tokens, scores, merges, model_type, pre, fallback)。
 
-    关键修复（molecule 发布 GGUF 词表损坏事件）：
-    必须使用与训练*完全一致*的基础分词器（Qwen2），并直接借助
-    ReducedTokenizer.new2old 映射从基础分词器取真实 token 字符串。
-    若基础分词器降级为 ByteLevelTok 兜底，则明确报错——否则会静默把
-    全部 token 写成占位符，导致生成的 GGUF 分词器彻底损坏
-    （llama.cpp 严格校验 abort 且生成不可读）。
+    自研词表布局（data/self_vocab.json）：
+      0..5     : 特殊符（含 <|im_start|>/<|im_end|>）
+      6..261   : <0x00>..<0xFF> 字节回退（256 个，保证词表外字符逐字节编码，永不乱码）
+      其余      : 标点/数字/英文/表情包固定集 + 语料高频中文字/词
+    导出时 tokenizer.ggml.pre 设为 "default"（llama.cpp 自带 byte_fallback，配合 <0xXX> 即可正确处理任意字符）。
     """
-    map_path = os.path.join(data_dir, "tokenizer_map.json")
-    if not os.path.exists(map_path):
-        # 防御性兜底：tokenizer_map 缺失时生成占位 token 列表，保证 GGUF 结构有效
-        # （分词器不精确，但文件可被 llama.cpp 加载；正常流程 assets 必含此文件）
+    vocab_path = os.path.join(data_dir, "self_vocab.json")
+    if not os.path.exists(vocab_path):
+        # 防御性兜底：词表缺失时生成占位 token 列表，保证 GGUF 结构有效（分词器不精确但可加载）
         tokens = [f"<tok{i}>" for i in range(cfg.vocab_size)]
         scores = [0.0] * cfg.vocab_size
         return tokens, scores, [], "llama", "default", True
-    base, is_fallback = get_base_tokenizer(cfg.tokenizer_name)
-    if is_fallback:
-        raise RuntimeError(
-            "导出时基础分词器降级为 ByteLevelTok 兜底，无法获得 Qwen2 真实 token 字符串，"
-            "会导致 GGUF 词表全部写成占位符而损坏。请保证导出环境能联网加载 Qwen2 分词器后再导出。"
-        )
-    tk = ReducedTokenizer.load(base, map_path)
-    tokens = [None] * tk.vocab_size
-    for nid in range(tk.vocab_size):
-        old = tk.new2old.get(nid)
-        if old is None:
-            tokens[nid] = f"<tok{nid}>"
-            continue
-        s = tk._base_id_to_token(old)
-        tokens[nid] = s if s else f"<tok{nid}>"
-    # 保证每个位置都有字符串（不应有 None）
-    for i in range(tk.vocab_size):
-        if tokens[i] is None:
-            tokens[i] = f"<tok{i}>"
-    scores = [0.0] * tk.vocab_size
+    meta = json.load(open(vocab_path, "r", encoding="utf-8"))
+    vocab = meta["vocab"]
+    tokens = list(vocab)
+    scores = [0.0] * len(tokens)
     merges = []
-    if hasattr(base, "save_pretrained"):
-        try:
-            import tempfile
-            tmp = tempfile.mkdtemp()
-            base.save_pretrained(tmp)
-            tj = json.load(open(os.path.join(tmp, "tokenizer.json"), "r", encoding="utf-8"))
-            kept = set(tokens)
-            for m in tj["model"].get("merges", []):
-                if isinstance(m, list):
-                    a, b = m[0], m[1]
-                else:
-                    a, b = m.split(" ")
-                if a in kept and b in kept:
-                    merges.append(f"{a} {b}")
-        except Exception as e:
-            print(f"[export] 合并对提取失败（{e}），仅写 token 列表。")
     model_type = "llama"
-    pre = "qwen2"
+    pre = "default"
     return tokens, scores, merges, model_type, pre, False
 
 
@@ -126,23 +87,20 @@ def main():
         model.load_state_dict(sd_state["model"])
     sd = model.state_dict()
 
-    # 找特殊符 id
-    base, _ = get_base_tokenizer(cfg.tokenizer_name)
-    qv = base.get_vocab()
-    map_path = os.path.join(args.data_dir, "tokenizer_map.json")
+    # 找特殊符 id（自研词表：<0x..> 字节回退 6..261；特殊符在词表前部）
+    vocab_path = os.path.join(args.data_dir, "self_vocab.json")
     eos_id, bos_id = 0, 0
-    if os.path.exists(map_path):
-        tk = ReducedTokenizer.load(base, map_path)
-        def new_id_of(tok):
-            oid = qv.get(tok)
-            return tk.old2new.get(oid, 0) if oid is not None else 0
-        eos_id = new_id_of("<|im_end|>")
-        bos_id = new_id_of("<|im_start|>")
+    if os.path.exists(vocab_path):
+        vocab = json.load(open(vocab_path, "r", encoding="utf-8"))["vocab"]
+        eos_id = vocab.index("<|im_end|>") if "<|im_end|>" in vocab else 0
+        bos_id = vocab.index("<|im_start|>")
+        if "<|im_start|>" not in vocab:
+            bos_id = 0
 
     writer = GGUFWriter(args.out, arch="llama")
     writer.add_name("molecule")
     writer.add_author("codecloud-dev")
-    writer.add_description("molecule V0.1 —— 0.1B 级开源小语言模型（通用架构 + 融合注意力机制）。")
+    writer.add_description("molecule —— 0.1B 级开源小语言模型（自研字表 + 深度融合架构），由 codecloud-dev 独立开发。")
     writer.add_license("apache-2.0")
     writer.add_version("1")
     # 架构元数据

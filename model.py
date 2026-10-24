@@ -147,11 +147,13 @@ class TransformerBlock(nn.Module):
         self.ffn = SwiGLU(cfg)
         self.attn_norm = RMSNorm(cfg.hidden_size, cfg.norm_eps)
         self.ffn_norm = RMSNorm(cfg.hidden_size, cfg.norm_eps)
+        # DeepNorm 残差增益：前向必须把子层输出乘 alpha（init 已按 1/alpha 缩小权重）
+        self.alpha = (2 * cfg.num_hidden_layers) ** 0.25 if cfg.deepnorm else 1.0
 
     def forward(self, x, cos, sin, attention_mask, past_kv=None):
         attn_out, kv = self.attn(self.attn_norm(x), cos, sin, attention_mask, past_kv)
-        x = x + attn_out
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.alpha * attn_out
+        x = x + self.alpha * self.ffn(self.ffn_norm(x))
         return x, kv
 
 

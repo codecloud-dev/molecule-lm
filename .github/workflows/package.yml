@@ -7,8 +7,9 @@ name: Package & Release molecule (CPU)
 #
 # 版本策略（用户要求）：
 #   - 每次训练成功都建立一个「真实版本」（GitHub Release，非 draft）。
-#   - 版本号由仓库根 VERSION 文件驱动，从 0.1 起逐次递增：0.1 → 0.2 → … → 0.9 → 1.0。
-#   - 封顶 V1.0：到达 1.0 后不再递增（绝不出现 1.1）；v1.0 作为「滚动最佳」反复重建。
+#   - 版本号由仓库根 VERSION 文件驱动：0.x 系列 0.1→0.9 递增；到达主版本号（1.x / 2.x …）
+#     后该主版本封顶（如 1.0 / 2.0），作为「滚动最佳」反复重建，绝不出现 1.1 / 2.1。
+#   - v2.0 为新大版本：自研字表 + 深度融合架构重构，从头训练，取代已废弃的 v1.x 方案。
 #   - 每次发版后回写 VERSION 并【自动触发下一代训练】以续训累积；
 #     仓库根存在 STOP_AUTOTRAIN 文件时停止自动续训（给用户一个停止开关）。
 
@@ -218,13 +219,13 @@ jobs:
             cp eval/eval_status_baseline.json "benchmarks/${TAG}.json"
           fi
 
-          # 版本推进（封顶 1.0）
+          # 版本推进：0.x 系列递增到 9 后进主版本；主版本（>=1）封顶为 ${MAJOR}.0 滚动最佳
           if [ "$MAJOR" -lt 1 ]; then
             MINOR=$((MINOR + 1))
             if [ "$MINOR" -gt 9 ]; then MAJOR=1; MINOR=0; fi
             NEXT="$MAJOR.$MINOR"
           else
-            NEXT="1.0"
+            NEXT="${MAJOR}.0"   # 主版本封顶：滚动重建当前主版本最佳（如 1.0 / 2.0），绝不出现 X.1
           fi
           echo "next VERSION=$NEXT"
 

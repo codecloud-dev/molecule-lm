@@ -10,7 +10,7 @@ import json
 @dataclass
 class MoleculeConfig:
     # ---- 架构（对齐 MobileLLM-125M 黄金配置）----
-    vocab_size: int = 32768          # 32K，由 Qwen2.5 词表按语料频率裁剪
+    vocab_size: int = 2500           # 自研字表（v2.0 起）：特殊符6 + 字节256 + 固定集 + 语料高频字/词 + 表情包
     hidden_size: int = 576
     intermediate_size: int = 1536    # 8/3 * 576，SwiGLU 标准预算
     num_hidden_layers: int = 30      # 深而窄
@@ -34,8 +34,9 @@ class MoleculeConfig:
     mtp_loss_weight: float = 0.1
 
     # ---- 分词器 ----
-    tokenizer_name: str = "Qwen/Qwen2.5-0.5B"  # 复用 Qwen2.5 分词器（含 byte fallback）
-    # 注：32K 词表在 data 构建时按语料频率裁剪得到
+    tokenizer_name: str = "self-designed"  # v2.0 起完全自研字表（零外部依赖），由 data/self_vocab.json 落盘
+    # 自研词表：特殊符 + 256 字节回退 + 标点/数字/英文/表情包固定集 + 语料高频中文字/词
+    # 详见 tokenizer_self.py；训练期用 SelfDesignedTokenizer 预分词，导出 GGUF 直接嵌入词表字符串。
 
     # ---- 训练 ----
     seed: int = 42
@@ -103,7 +104,7 @@ class MoleculeConfig:
     )
 
     # ---- 版本 ----
-    model_version: str = "v0.1.0"
+    model_version: str = "v2.0.0"
 
     def to_dict(self):
         return asdict(self)

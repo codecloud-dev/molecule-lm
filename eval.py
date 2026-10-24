@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import MoleculeConfig
 from model import MoleculeModel
-from tokenizer import ReducedTokenizer, get_base_tokenizer
+from tokenizer_self import SelfDesignedTokenizer
 from benchmarks import get_benchmark
 
 
@@ -182,8 +182,8 @@ def main():
     args = ap.parse_args()
 
     cfg = MoleculeConfig.load(args.config) if os.path.exists(args.config) else MoleculeConfig()
-    base, _ = get_base_tokenizer(cfg.tokenizer_name)
-    tk = ReducedTokenizer.load(base, os.path.join(args.data_dir, "tokenizer_map.json"))
+    vocab_path = os.path.join(args.data_dir, "self_vocab.json")
+    tk, _ = SelfDesignedTokenizer.load(vocab_path)
 
     model = MoleculeModel(cfg)
     # 加载权重

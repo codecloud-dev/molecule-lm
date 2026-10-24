@@ -18,7 +18,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import MoleculeConfig
 from model import MoleculeModel
-from tokenizer import ReducedTokenizer
+from tokenizer_self import SelfDesignedTokenizer
 
 SYS_IDENTITY = (
     "你是 molecule，一个开源语言模型，由 codecloud-dev 独立开发。"
@@ -78,9 +78,8 @@ def load_model_tokenizer(cfg, data_dir, ckpt):
         sd = torch.load(os.path.join("checkpoints", "latest.ckpt"), map_location="cpu")
         model.load_state_dict(sd["model"])
     model.eval()
-    from tokenizer import get_base_tokenizer
-    base, _ = get_base_tokenizer(cfg.tokenizer_name)
-    tk = ReducedTokenizer.load(base, os.path.join(data_dir, "tokenizer_map.json"))
+    vocab_path = os.path.join(data_dir, "self_vocab.json")
+    tk, _ = SelfDesignedTokenizer.load(vocab_path)
     return model, tk
 
 

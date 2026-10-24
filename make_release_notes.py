@@ -31,7 +31,7 @@ notes = f"""# molecule {TAG}
 纯 CPU 训练的开源语言模型，单次训练 ≤6h，跨轮续训累积 checkpoints。本版本基于 VERSION={VERSION} 自动发布。
 
 - **架构**：decoder-only Transformer（约 129M），融合 RoPE-NTK / SwiGLU / RMSNorm+Pre-Norm / QK-Norm / logit soft-capping / DeepNorm / MTP（1 模块）/ 权重共享。
-- **分词**：Qwen2.5 tokenizer 裁 32K + 字节级兜底。
+- **分词**：自研字表（约 2500：特殊符 + 256 字节回退 + 标点/数字/英文 + 表情包 + 语料高频中文字/词），零外部依赖。
 - **训练**：Muon+AdamW 混合、WSD、bf16、seed=42、全量 resume。
 - **蒸馏**：CI 内 5 个开源教师模型（general / reason / math / code / eq）分领域生成式数据蒸馏。
 - **能力**：支持工具调用。

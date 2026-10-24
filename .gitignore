@@ -1,5 +1,6 @@
 # 训练产物（由 CI / 本地训练生成，不进仓库）
 checkpoints/
+checkpoints_smoke/
 data/
 config.json
 eval_result*.md

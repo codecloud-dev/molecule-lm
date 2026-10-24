@@ -29,7 +29,7 @@ from data import build_domain_bin, load_domain_bin
 
 def test_config():
     cfg = MoleculeConfig()
-    assert cfg.vocab_size == 32768
+    assert cfg.vocab_size == 2500
     assert cfg.hidden_size == 576
     assert cfg.num_hidden_layers == 30
     assert cfg.num_attention_heads == 9

@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import MoleculeConfig
 from model import MoleculeModel, count_params
 from optim import build_optimizers, build_schedulers
-from tokenizer import ReducedTokenizer, get_base_tokenizer
+from tokenizer_self import SelfDesignedTokenizer, build_from_seed
 from data import MixedTokenDataset, list_bins, build_all_bins
 
 torch.set_num_threads(max(1, min(os.cpu_count() or 1, 8)))
@@ -34,22 +34,17 @@ def detect_bf16():
 
 
 def build_tokenizer(cfg, data_dir):
+    """v2.0 起使用完全自研字表（零外部依赖）。
+
+    词表由 tokenizer_self.build_from_seed 基于种子语料（+教师数据若已生成）构建，
+    落盘到 data/self_vocab.json；含 256 个 <0xXX> 字节回退 token，永不乱码。
+    """
     os.makedirs(data_dir, exist_ok=True)
-    map_path = os.path.join(data_dir, "tokenizer_map.json")
-    base, is_fallback = get_base_tokenizer(cfg.tokenizer_name)
-    if os.path.exists(map_path):
-        tk = ReducedTokenizer.load(base, map_path)
-        print(f"[tok] loaded reduced vocab size={tk.vocab_size}")
-        return tk
-    # 用种子语料（含教师数据若已生成）做频率统计
-    from seed_corpus import SEED
-    corpus = []
-    for d in SEED:
-        corpus.extend(SEED[d])
-    tk = ReducedTokenizer.build_from_corpus(
-        base, corpus, target_size=cfg.vocab_size, cache_path=map_path
-    )
-    print(f"[tok] built reduced vocab size={tk.vocab_size}")
+    vocab_path = os.path.join(data_dir, "self_vocab.json")
+    if not os.path.exists(vocab_path):
+        build_from_seed(vocab_path, target_size=cfg.vocab_size)
+    tk, meta = SelfDesignedTokenizer.load(vocab_path)
+    print(f"[tok] self-designed vocab size={tk.vocab_size}（特殊符+字节256+表情包+中英文/标点）")
     return tk
 
 
@@ -115,12 +110,25 @@ def main():
     ckpt = os.path.join(args.out_dir, "latest.ckpt")
     step = 0
     if args.resume and os.path.exists(ckpt):
-        st = torch.load(ckpt, map_location=device)
-        model.load_state_dict(st["model"])
-        muon.load_state_dict(st["muon"])
-        adam.load_state_dict(st["adam"])
-        step = st["step"]
-        print(f"[resume] step={step}")
+        try:
+            st = torch.load(ckpt, map_location=device)
+            # 词表守卫：若检查点词表维度与当前不一致（如 v1.0→v2.0 自研字表重构），
+            # 形状无法对齐，必须放弃续训、从头训练，避免 load_state_dict 崩溃。
+            ckpt_vocab = None
+            emb = st.get("model", {}).get("embed.weight")
+            if emb is not None:
+                ckpt_vocab = int(emb.shape[0])
+            if ckpt_vocab is not None and ckpt_vocab != cfg.vocab_size:
+                print(f"[resume] 跳过续训：检查点词表={ckpt_vocab} ≠ 当前词表={cfg.vocab_size}"
+                      f"（词表已重构，v2.0 从头训练）")
+            else:
+                model.load_state_dict(st["model"])
+                muon.load_state_dict(st["muon"])
+                adam.load_state_dict(st["adam"])
+                step = st["step"]
+                print(f"[resume] step={step}")
+        except Exception as e:
+            print(f"[resume] 检查点加载失败（{e}），放弃续训、从头训练")
 
     os.makedirs(args.out_dir, exist_ok=True)
     micro_bs = 4  # CPU 安全 microbatch；梯度累积到 global_tokens_per_step
