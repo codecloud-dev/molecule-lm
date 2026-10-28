@@ -24,3 +24,8 @@ PITFALLS.md
 
 # 技术设计文档（仅本地，不纳入公开仓库；实现蓝图 / 技术细节不公开，开发者本地参考）
 DESIGN.md
+docs_v3_full.txt
+
+# 本地评测产物（CI 内重新生成）
+eval_v3_result.json
+eval_result*.json

@@ -15,7 +15,11 @@
 
 molecule 的目标很单纯：**让一个能跑 llama.cpp 的弱设备（手机、树莓派、老旧/低配 CPU）也能本地跑起一个能对话的中文小模型**。它体积小（q4 量化后约 0.1GB）、完全开源、不依赖任何外部服务。在通用 decoder-only Transformer 的基础上，它针对小参数场景做了专项优化，把**体积、可移植和开放性**放在第一位。
 
-当前版本**不追求极致推理速度**（够用即可）；后续会单独做一个以速度为核心的 Flash 优化版本。
+**开源语言模型·代号 molecule·由 codecloud-dev 独立开发**
+
+> **当前进展**：新一代 **molecule v3.0** 正在基于「统一认知架构（深度熔铸）」重构骨干——一个把多种原生能力熔铸进同一块小钢里的自研模型，纯 CPU 训练、体积小、可本地部署。v3.0 当前处于**地基训练阶段**（先在 GitHub Actions 上持续续训夯骨干，目标能生成通顺中文），相关代码与导出器已在仓库 `main` 分支就绪，并随 CI 自动累积训练、达到 10 天训练量后发布基础模型版本。
+
+molecule 的目标很单纯
 
 ---
 
@@ -29,6 +33,21 @@ molecule 的目标很单纯：**让一个能跑 llama.cpp 的弱设备（手机�
 | 部署 | llama.cpp / Ollama 一行命令即可本地跑，不联网 |
 | 训练 | 纯 CPU（GitHub Actions 免费 runner），单轮 ≤6h，跨轮续训累积 |
 | 透明 | 数据来源、评测口径、版本数据全部公开可查 |
+
+---
+
+## molecule v3.0（下一代，重构中）
+
+molecule v3.0 是**同一个开源小模型的下一阶段**，核心变化是把原来「多个外挂模块拼装」的做法，替换成**统一认知架构（深度熔铸）**：
+
+- **一个模型、一块小钢**：把推理、记忆、工具调用、自我监控等多种能力熔铸进同一个骨干，共享同一份内部表示，不再靠模块之间反复「翻译」来协作。
+- **纯 CPU 可训、体积小、好部署**：沿用 molecule 一贯的轻量路线，弱设备也能本地跑。
+- **分阶段熔铸**：v3.0 先把骨干地基训扎实，再逐步熔铸高级能力——不急于一次塞满，避免「伪熔铸」。
+- **开源不变**：架构图、训练数据、评测口径、版本数据继续全部公开。
+
+> 当前 v3.0 处于**地基训练阶段**：正在 GitHub Actions 上纯 CPU 持续续训（每轮 ≤6h、跨轮自动续训累积），先把骨干训练扎实，达到约 10 天训练量后发布基础模型版本 `v3.0`；后续熔铸阶段随训练累积逐步开放。
+
+**本地怎么跑 v3.0（发布后）**：取 Release 里的 `molecule-v3.gguf`，用任意兼容 GGUF 的推理引擎（llama.cpp / Ollama / 项目私有 MInfer 引擎）本地对话即可，纯离线、不联网。如需在仓库内训练/导出：`python train_v3.py --resume`、`python export_gguf_v3.py --ckpt checkpoints/v3.pt --out molecule-v3.gguf --quant f16`。
 
 ---
 
@@ -129,6 +148,15 @@ llama-server -m molecule-q4_K_M.gguf
 > ```bash
 > touch STOP_AUTOTRAIN && git add STOP_AUTOTRAIN && git commit -m "stop autotrain" && git push
 > ```
+
+### molecule v3.0（基础模型）
+
+- v3.0 是 molecule 下一阶段的基础版本，基于「统一认知架构（深度熔铸）」重构的骨干；**当前在 GitHub Actions 上纯 CPU 持续续训**，累计训练约 10 天后发布基础模型版本 `v3.0`（封顶，作为「滚动最佳」重建，绝不出现 3.1）。
+- 发布文件：`molecule-v3.gguf`（F16 半精度发布版）+ `molecule-v3-source.gguf`（F32 精确源，供私有推理引擎做逐层混合精度量化）。
+- **停止开关**：仓库根放 `STOP_V3` 文件即停止 v3.0 自动续训与发版：
+  ```bash
+  touch STOP_V3 && git add STOP_V3 && git commit -m "stop v3 autotrain" && git push
+  ```
 - 每个版本的评测与版本说明**同时写入仓库**（不只 GitHub Release）：`releases/vX.Y.md`（版本说明）+ `benchmarks/vX.Y.json`（当版评测趋势，含生成式/代码能力及格结果），可在仓库内直接查阅历史版本数据。
 
 ---

@@ -101,12 +101,37 @@ def test_kv_cache_matches_full():
     print(f"[PASS] test_kv_cache_matches_full: KV 缓存与全量一致，生成 {gen.shape[1]} token 合法")
 
 
+def test_v3_step_matches_full():
+    """v3.0 增量 step（O(L) 流式）必须与全量 forward 数值一致。
+
+    这条测试专门守护 v3 增量路径曾踩过的四类坑：
+      - Mamba 分块扫描的因果掩码维度、增量卷积取指位置
+      - BinaryAttention 增量缺 norm_attn / 维度 / 残差+FFN
+      - 权重共享 ≠ 状态共享：递归状态必须逐层独立（同组相邻层输入不同）
+    """
+    from model_v3 import MoleculeV3
+    torch.manual_seed(0)
+    model = MoleculeV3().eval()
+    T0 = 20
+    ids = torch.randint(0, model.vocab_size, (1, T0))   # 不依赖分词器，纯随机序列
+    with torch.no_grad():
+        full = model(ids)["logits"][0, -1]               # 全量最后一位
+        st = model.init_state(1)
+        lg = None
+        for t in ids[0]:
+            lg = model.step(t.view(1, 1), st)[0, 0]       # 增量逐 token
+    diff = (full - lg).abs().max().item()
+    assert diff < 1e-4, "v3 增量 step 与全量 forward 不一致: %.3e" % diff
+    print("[PASS] test_v3_step_matches_full: 增量 step 与全量 forward 一致 (max|Δ|=%.2e)" % diff)
+
+
 def _run_all():
     test_config()
     test_forward_finite()
     test_byte_level_roundtrip()
     test_build_domain_bin_nonempty()
     test_kv_cache_matches_full()
+    test_v3_step_matches_full()
     print("\nALL OFFLINE TESTS PASSED ✓")
 
 

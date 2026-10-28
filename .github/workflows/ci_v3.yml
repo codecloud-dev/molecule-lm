@@ -1,0 +1,254 @@
+name: molecule v3 基础模型 · 续训 / 发版（CPU）
+
+# v3.0 基础模型 CI：训练 → 导出 GGUF → 【10 天发版闸门】→ 自续训。
+#
+# 纪律（设计文档 §10 / §12.1）：v3.0 只夯骨干，什么高级功能都不接；目标 PPL<10，能生成通顺中文。
+# 续训链：每轮从 resume-v3 检查点续训，导出 GGUF 产物；累计训练时长（data/v3_clock.json）
+#   达到 10 天（240h）后才创建 GitHub Release v3.0（封顶，绝不 3.1），之后停止自动续训。
+#   未到 10 天则每轮只导出产物 + 自续训累积，不发版。
+#
+# 触发：
+#   - workflow_dispatch：手动启动首轮（需人工或本地 gh workflow run 触发）。
+#   - repository_dispatch (continue-v3)：上一轮结束自动续训（GITHUB_TOKEN 即可，无需 PAT）。
+# 停止开关：仓库根存在 STOP_V3 文件时，本轮结束后不再续训、也不发版。
+#
+# 注意：v3 链不碰根 VERSION（保持 2.0，旧续训链不受影响）；版本号 v3.0 在本工作流内硬编码。
+
+on:
+  workflow_dispatch:
+    inputs:
+      seq_len:
+        description: "序列长度"
+        required: false
+        default: "256"
+      batch:
+        description: "全局 batch（序列数）"
+        required: false
+        default: "4"
+      max_minutes:
+        description: "单轮训练软时限（分钟），到点优雅停止并保存"
+        required: false
+        default: "280"
+  repository_dispatch:
+    types: [continue-v3]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360            # = 6h 硬限边界；预算：安装20 + 语料/分词 + 训练285 + 评测20 + 导出/发版 = <360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Offline self-test（回归护栏：增量 step 与全量 forward 一致等）
+        timeout-minutes: 10
+        run: |
+          python tests/test_offline.py
+
+      - name: Resume from previous v3 run
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list --workflow "molecule v3 基础模型 · 续训 / 发版（CPU）" \
+                    --status success,failure,cancelled --limit 10 \
+                    --json databaseId --jq \
+                    '.[] | select(.databaseId != ${{ github.run_id }}) | .databaseId' \
+                    | head -1 || true)
+          if [ -n "$RUN_ID" ]; then
+            echo "Resuming from run $RUN_ID"
+            gh run download "$RUN_ID" --name "resume-v3" --dir checkpoints || echo "no previous resume artifact"
+            gh run download "$RUN_ID" --name "assets-v3" --dir . || echo "no previous assets artifact"
+          else
+            echo "No previous completed v3 run to resume from（从零开始）"
+          fi
+
+      - name: Train v3 基础模型（CPU，时间驱动停止）
+        timeout-minutes: 290
+        env:
+          OMP_NUM_THREADS: "4"
+        run: |
+          timeout 285m python train_v3.py \
+            --seq_len "${{ inputs.seq_len || '256' }}" \
+            --batch "${{ inputs.batch || '4' }}" \
+            --max_minutes "${{ inputs.max_minutes || '280' }}" \
+            --resume
+
+      - name: 模型冒烟评测（趋势监控，异常不阻塞）
+        timeout-minutes: 20
+        continue-on-error: true
+        run: |
+          timeout 18m python eval_v3.py --out eval_v3_result.json || echo "[eval] 异常跳过"
+          python - <<'PY' || true
+          import json
+          try:
+              d = json.load(open('eval_v3_result.json'))
+              p = sum(1 for r in d if r['ok'])
+              print('评测通过 %d/%d' % (p, len(d)))
+          except Exception as e:
+              print('eval status n/a:', e)
+          PY
+
+      - name: 记录 MetaRSI 调度（离线，零用户侧影响）
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          python - <<'PY' || true
+          import torch, subprocess
+          try:
+              s = torch.load('checkpoints/v3.pt', map_location='cpu', weights_only=False)
+              step = s.get('step', 0)
+              loss = s.get('loss', 0.0)
+          except Exception:
+              step, loss = 0, 0.0
+          subprocess.run(['python', 'metarsi.py', 'update',
+                          '--step', str(step), '--loss', str(round(loss, 4))], check=False)
+          subprocess.run(['python', 'metarsi.py', 'suggest'], check=False)
+          PY
+
+      - name: Upload resume + assets artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-v3
+          path: checkpoints
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload assets-v3（词表/配置/时钟/调度/评测）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-v3
+          path: |
+            data/self_bpe_8192.json
+            data/v3_clock.json
+            config_v3.json
+            molecule_rsi_status.md
+            eval_v3_result.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Export GGUF（f32 精确源 + f16 半精度发布版）
+        timeout-minutes: 20
+        run: |
+          timeout 18m python export_gguf_v3.py --ckpt checkpoints/v3.pt \
+            --out molecule-v3-source.gguf --quant f32
+          timeout 18m python export_gguf_v3.py --ckpt checkpoints/v3.pt \
+            --out molecule-v3.gguf --quant f16
+          ls -lh molecule-v3*.gguf
+
+      - name: Upload GGUF release artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gguf-release-v3
+          path: |
+            molecule-v3-source.gguf
+            molecule-v3.gguf
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ---- 10 天发版闸门 ----
+      - name: Release gate（累计训练 ≥10 天 → 发 v3.0 并停止；否则续训）
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          HOURS=0
+          if [ -f data/v3_clock.json ]; then
+            HOURS=$(python -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))")
+          fi
+          echo "累计训练小时: $HOURS / 240（10 天）"
+          echo "hours=$HOURS" >> "$GITHUB_OUTPUT"
+
+          if [ -f STOP_V3 ]; then
+            echo "STOP_V3 存在：停止续训，不发版。"
+            echo "continue=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 未到 10 天：只续训，不发版
+          python -c "import sys;sys.exit(0 if $HOURS >= 240 else 1)" && REACHED=1 || REACHED=0
+          if [ "$REACHED" -eq 0 ]; then
+            echo "未到 10 天，继续续训累积（本轮 GGUF 已导出为产物）。"
+            echo "continue=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 到 10 天：创建 GitHub Release v3.0（封顶，删除旧 v3.0 重建）
+          echo "已达 10 天，发版 v3.0 并停止自动续训。"
+          TAG="v3.0"
+          for f in molecule-v3-source.gguf molecule-v3.gguf; do
+            if [ ! -f "$f" ]; then echo "缺少 $f，跳过发版"; echo "continue=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          done
+          {
+            echo "# molecule v3.0 · 统一熔铸混合骨干（基础模型）"
+            echo
+            echo "v3.0 是 molecule 系列第一个可交付的基础版本：Mamba+BinaryAttention 混合线性骨干，"
+            echo "24 层 Mamba 线性递推 + 6 层 BinaryAttention（4:1），640d、块级权重共享、8192 byte-level BPE、DeepNorm α=2.78、MTP + Z-loss。"
+            echo
+            echo "本版本只夯骨干（设计文档 §10/§12.1）：什么高级功能都不接，目标 PPL<10、能生成通顺中文。"
+            echo "System1 / 元认知 / 效价 / 认知调度器 / 工具调用 / 双轨记忆 / 潜空间推理均为 v3.5+ 的熔铸阶段。"
+            echo
+            echo "发布文件："
+            echo "- molecule-v3.gguf：F16 半精度发布版（约 160MB，MInfer / llama.cpp 可直接加载）"
+            echo "- molecule-v3-source.gguf：F32 精确源（MInfer 逐层混合精度量化用）"
+            echo
+            if [ -f eval_v3_result.json ]; then
+              P=$(python -c "import json;d=json.load(open('eval_v3_result.json'));print('%d/%d'%(sum(1 for r in d if r['ok']),len(d)))")
+              echo "评测通过：$P（同口径 20 题，仅趋势监控）"
+            fi
+            if [ -f data/v3_clock.json ]; then
+              C=$(python -c "import json;c=json.load(open('data/v3_clock.json'));print('%d 轮 / %.0f 小时 / %.1fB token'%(c['runs'],c['total_minutes']/60.0,c['total_tokens']/1e9))")
+              echo "训练累计：$C"
+            fi
+            if [ -f molecule_rsi_status.md ]; then
+              echo; echo "## 训练调度状态（MetaRSI）"; cat molecule_rsi_status.md
+            fi
+          } > notes.md
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" -y || true
+            git push --delete origin "$TAG" >/dev/null 2>&1 || true
+          fi
+          gh release create "$TAG" --title "molecule v3.0（基础模型）" --notes-file notes.md \
+            molecule-v3.gguf molecule-v3-source.gguf
+          echo "release $TAG 完成"
+
+          mkdir -p releases benchmarks
+          cp notes.md "releases/${TAG}.md"
+          [ -f eval_v3_result.json ] && cp eval_v3_result.json "benchmarks/${TAG}.json"
+          git config user.email "ci@codecloud.dev"
+          git config user.name "molecule CI"
+          git add releases benchmarks
+          if git diff --cached --quiet; then
+            echo "无新版本数据可提交"
+          else
+            git pull --rebase origin main || git rebase origin/main || true
+            git commit -m "data: release ${TAG} notes + benchmarks [skip ci]"
+            git push origin HEAD:refs/heads/main
+          fi
+          echo "continue=false" >> "$GITHUB_OUTPUT"
+
+      - name: 继续续训（repository_dispatch 自触发，无需 PAT）
+        if: steps.gate.outputs.continue == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "自动续训下一轮..."
+          gh api repos/$GITHUB_REPOSITORY/dispatches -f event_type=continue-v3
