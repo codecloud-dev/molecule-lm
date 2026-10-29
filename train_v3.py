@@ -22,6 +22,7 @@ import json
 import math
 import os
 import signal
+import subprocess
 import time
 
 import numpy as np
@@ -97,10 +98,51 @@ def save_clock(clk):
         json.dump(clk, f, ensure_ascii=False, indent=2)
 
 
-def save_checkpoint(model, opt, step, loss, run_lm, tokens_this_run, clk, atomic=True):
+# —— 抗取消：时钟按「实际训练分钟」增量累加，每次存档都记，绝不只在结尾记 ——
+# 这样即使 run 被平台取消，最后一次周期存档里已经含有到此为止的累计分钟/ token，
+# 下一轮 resume 不会丢失进度。用增量（delta）避免重复计数。
+_t_start = 0.0
+_counted_t = 0.0
+_counted_tokens = 0
+
+
+def accrue_clock(clk, tokens_this_run, last_step):
+    """把「上一次记账以来」实际训练分钟与新增 token 累加到 clk（增量，不重复计）。"""
+    global _counted_t, _counted_tokens
+    now = time.time()
+    el = (now - _counted_t) / 60.0
+    if el > 0:
+        clk["total_minutes"] = clk.get("total_minutes", 0.0) + el
+    new_tok = tokens_this_run - _counted_tokens
+    if new_tok > 0:
+        clk["total_tokens"] = clk.get("total_tokens", 0) + new_tok
+    clk["total_steps"] = last_step
+    clk["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _counted_t = now
+    _counted_tokens = tokens_this_run
+
+
+def persist():
+    """把最新 checkpoint + 时钟 + 语料推到滚动发布（抗取消持久化）。非阻塞 fire-and-forget。"""
+    try:
+        if os.environ.get("V3_PERSIST", "1") == "0":
+            return
+        subprocess.Popen(
+            [sys.executable, "persist_v3.py"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def save_checkpoint(model, opt, step, loss, run_lm, tokens_this_run, clk,
+                    atomic=True, block_persist=False):
     """原子存档：先写临时文件再 rename，避免 CI 被回收时留下半截损坏文件。
     注意：不持久化 optimizer 状态——checkpoint 体积从 ~958MB 降到 ~320MB，CI 写盘快 3 倍；
     CPU 小模型的 AdamW momentum 在续训几百步内重建，影响可忽略。
+
+    每次存档都：① 增量累加时钟（抗取消，进度不丢）② 推到滚动发布（block_persist=True
+    时阻塞等待，用于优雅退出前的最后一笔，尽量保证这帧也落库）。
     """
     os.makedirs("checkpoints", exist_ok=True)
     payload = {"model": model.state_dict(),
@@ -113,7 +155,20 @@ def save_checkpoint(model, opt, step, loss, run_lm, tokens_this_run, clk, atomic
         os.replace(tmp, CKPT)
     else:
         torch.save(payload, CKPT)
+    # 增量记账（抗取消核心）：这一帧之前的实际训练分钟/ token 全部入账。
+    accrue_clock(clk, tokens_this_run, step)
     save_clock(clk)
+    # 抗取消持久化：周期存档非阻塞；结尾存档阻塞等待（优雅退出前最后一笔尽量落库）。
+    if block_persist:
+        try:
+            if os.environ.get("V3_PERSIST", "1") != "0":
+                subprocess.run([sys.executable, "persist_v3.py"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=900)
+        except Exception:
+            pass
+    else:
+        persist()
 
 
 def main():
@@ -124,8 +179,9 @@ def main():
     ap.add_argument("--lr", type=float, default=PEAK_LR)
     ap.add_argument("--max_minutes", type=float, default=75,
                     help="单轮训练软时限（分钟）；到点优雅停止并保存。务必小于 CI 硬限与平台回收边界。")
-    ap.add_argument("--save_every", type=float, default=1000,
-                    help="周期存档间隔（分钟）；默认 1000=仅结尾存档一次（CI 写盘慢时避免多轮慢写拖垮单轮撞 timeout）。手动可调小以加强防取消保护")
+    ap.add_argument("--save_every", type=float, default=10,
+                    help="周期存档间隔（分钟）；默认 10=每 10 分钟落一帧并推滚动发布，"
+                         "抗 CI 取消：最坏只丢 10 分钟。CI 写盘慢也不撞 timeout（本地写盘快，上传非阻塞）。")
     ap.add_argument("--allow_download", action="store_true",
                     help="允许下载公开语料增强（默认关闭：CI 稳定优先，只用内置高质量 seed；")
     ap.add_argument("--resume", action="store_true")
@@ -166,8 +222,13 @@ def main():
     model.train()
 
     t_start = time.time()
+    global _t_start, _counted_t, _counted_tokens
+    _t_start = t_start
+    _counted_t = t_start
+    _counted_tokens = 0
     last_save = t_start
     run_lm = run_mtp = None
+    loss = 0.0  # 兜底：若本轮 0 步（已达 max_steps）也能安全存档
     last_step = step0
     tokens_this_run = 0
     clk = load_clock()
@@ -199,21 +260,18 @@ def main():
             ppl = math.exp(min(run_lm, 20))
             print("[step %d] loss=%.3f (lm=%.3f mtp=%.3f) ppl≈%.2f lr=%.2e %.1f min"
                   % (step + 1, loss.item(), run_lm, run_mtp, ppl, lr, el))
-        # 周期存档（CI 鲁棒性）：只存权重，时钟在结尾统一累加，避免重复/半截
+        # 周期存档（抗取消）：落本地帧 + 增量记账 + 推滚动发布（非阻塞），最坏只丢 save_every 分钟
         if (time.time() - last_save) / 60 >= args.save_every:
             save_checkpoint(model, opt, last_step, loss, run_lm, tokens_this_run, clk)
             last_save = time.time()
-            print("[save] step %d 周期存档" % last_step)
+            print("[save] step %d 周期存档（已记账+推滚动发布）" % last_step)
 
-    # 累计训练时钟（供 10 天发版闸门）：本轮时长一次性累加，周期存档不重复计
+    # 本轮结束：轮次 +1（仅此处记一次），最后再落一帧并【阻塞】推滚动发布
+    # （优雅退出/软时限到点前的最后一笔，尽量保证这帧也落库，抗 CI 取消）。
     elapsed = (time.time() - t_start) / 60.0
-    clk["total_minutes"] += elapsed
-    clk["total_tokens"] += tokens_this_run
-    clk["total_steps"] = last_step
-    clk["runs"] += 1
-    clk["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    clk["runs"] = clk.get("runs", 0) + 1
 
-    save_checkpoint(model, opt, last_step, loss, run_lm, tokens_this_run, clk)
+    save_checkpoint(model, opt, last_step, loss, run_lm, tokens_this_run, clk, block_persist=True)
     print("[done] checkpoint -> %s | 本轮 %.1f 分钟 | 累计 %.1f 分钟 / %.1f 小时（%d 轮）"
           % (CKPT, elapsed, clk["total_minutes"], clk["total_minutes"] / 60.0, clk["runs"]))
 

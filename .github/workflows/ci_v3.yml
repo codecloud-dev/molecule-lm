@@ -7,15 +7,19 @@ name: molecule v3 基础模型 · 续训 / 发版（CPU）
 #   导出 GGUF 产物；累计训练时长（data/v3_clock.json）达到 10 天（240h）后才创建 GitHub Release v3.0
 #   （封顶，绝不 3.1），之后停止自动续训；未到 10 天则每轮只导出产物 + 自续训累积。
 #
-# 鲁棒性设计（应对 CI 被回收/取消导致的中间步骤不执行）：
-#   - 训练步骤 continue-on-error，软超时不阻断后续；单轮压短（默认 75min）远小于平台回收边界，降低撞边界概率与单轮损失。
-#   - 续训步骤 if: always() 且【内部】读 v3_clock + STOP_V3 判闸门，不依赖上游 step 的 outputs。
-#   - checkpoint / 语料 / 时钟 均 if: always() 上传 artifact，每轮结束都留档，下一轮 resume 接上，链自愈。
+# 鲁棒性设计（应对 CI 平台在训练中取消 run，cancel_actor=null 非人为）：
+#   - 训练步骤 continue-on-error，软超时不阻断后续；单轮压短（默认 75min）。
+#   - 抗取消持久化（核心）：每次周期存档 + 优雅退出(SIGTERM) 都把最新 checkpoint + 时钟 +
+#     语料推到【仓库级滚动发布 v3-checkpoint】（gh release upload --clobber）。滚动发布不受单次
+#     run 被取消影响——而 workflow 的 if:always artifact 上传在被取消时不会执行，不可靠。
+#     下一轮 Resume 直接从滚动发布拉取，链自愈，10 天时钟按实际训练分钟准确累加。
+#   - 续训步骤 if: always() 且【内部】读 v3_clock + STOP_V3 + 去重判闸门，不依赖上游 step 的 outputs；
+#     去重：若已存在其它 in_progress 的 v3 run，则跳过本次续训，避免 continue-v3 分叉成多链。
 #
 # 触发：
 #   - workflow_dispatch：手动启动首轮。
 #   - repository_dispatch (continue-v3)：上一轮结束自动续训（需 actions:write 权限，已授予）。
-# 停止开关：仓库根存在 STOP_V3 文件时，本轮结束后不再续训、也不发版。
+# 停止开关：仓库变量 STOP_V3 置位 或 仓库根存在 STOP_V3 文件时，本轮结束后不再续训、也不发版。
 
 on:
   workflow_dispatch:
@@ -33,9 +37,9 @@ on:
         required: false
         default: "75"
       save_every:
-        description: "周期存档间隔（分钟）；默认 1000=仅结尾存档一次"
+        description: "周期存档间隔（分钟）；默认 10=每 10 分钟落一帧并推滚动发布，抗 CI 取消最坏只丢 10 分钟"
         required: false
-        default: "1000"
+        default: "10"
   repository_dispatch:
     types: [continue-v3]
 
@@ -66,32 +70,32 @@ jobs:
         run: |
           python tests/test_offline.py
 
-      - name: Resume from previous v3 run（复用检查点 + 语料 + 时钟）
+      - name: Resume from rolling checkpoint（v3-checkpoint 滚动发布，抗取消）
         timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 取最近一个已完成（completed）的同类 run id（避开当前 run）；单值 status 过滤，避免新版 gh 拒绝逗号多值
-          RUN_ID=$(gh run list --workflow "molecule v3 基础模型 · 续训 / 发版（CPU）" \
-                    --limit 30 --status completed \
-                    --json databaseId --jq \
-                    '.[] | select(.databaseId != ${{ github.run_id }}) | .databaseId' \
-                    | head -1 || true)
-          if [ -n "$RUN_ID" ]; then
-            echo "Resuming from run $RUN_ID"
-            gh run download "$RUN_ID" --name "resume-v3" --dir . || echo "no resume-v3 artifact in $RUN_ID"
-            gh run download "$RUN_ID" --name "corpus-v3" --dir . || echo "no corpus-v3 artifact in $RUN_ID"
-            gh run download "$RUN_ID" --name "assets-v3"  --dir . || echo "no assets-v3 artifact in $RUN_ID"
+          set -uo pipefail
+          # 单一持久源：滚动发布 v3-checkpoint（checkpoint + 时钟 + 语料），抗取消；
+          # 平台取消 run 时 if:always artifact 会丢失，但滚动发布是仓库级持久存储，不受影响。
+          if gh release view v3-checkpoint >/dev/null 2>&1; then
+            echo "从滚动发布 v3-checkpoint 续训..."
+            gh release download v3-checkpoint -p "v3.pt" -D checkpoints 2>/dev/null || echo "[resume] 无 v3.pt"
+            gh release download v3-checkpoint -p "v3_clock.json" -D data 2>/dev/null || echo "[resume] 无 v3_clock.json"
+            gh release download v3-checkpoint -p "v3_*.bin" -D data 2>/dev/null || echo "[resume] 无语料 bin"
+            gh release download v3-checkpoint -p "self_bpe_8192.json" -D data 2>/dev/null || echo "[resume] 无 BPE"
           else
-            echo "No previous completed v3 run to resume from（从零开始）"
+            echo "无滚动检查点（首轮），从零开始训练。"
           fi
-          ls -la checkpoints data 2>/dev/null | head -30
+          echo "--- checkpoints ---"; ls -la checkpoints 2>/dev/null | head
+          echo "--- data ---"; ls -la data 2>/dev/null | head
 
-      - name: Train v3 基础模型（CPU，时间驱动停止，周期存档）
+      - name: Train v3 基础模型（CPU，时间驱动停止，周期存档 + 抗取消持久化）
         timeout-minutes: 95
         continue-on-error: true
         env:
           OMP_NUM_THREADS: "4"
+          GH_TOKEN: ${{ github.token }}
         run: |
           timeout 80m python -u train_v3.py \
             --seq_len "${{ inputs.seq_len || '256' }}" \
@@ -178,6 +182,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          STOP_V3: ${{ vars.STOP_V3 }}
         run: |
           set -uo pipefail
           HOURS=0
@@ -187,8 +192,17 @@ jobs:
           echo "累计训练小时: $HOURS / 240（10 天）"
 
           CONTINUE=true
-          if [ -f STOP_V3 ]; then
-            echo "STOP_V3 存在：停止续训，不发版。"
+          # 去重：若已存在其它 in_progress 的 v3 run，跳过本次续训，避免 continue-v3 分叉成多链
+          OTHER=$(gh run list --workflow "molecule v3 基础模型 · 续训 / 发版（CPU）" \
+                    --status in_progress --json databaseId --jq \
+                    '.[] | select(.databaseId != ${{ github.run_id }}) | .databaseId' | wc -l)
+          if [ "${OTHER:-0}" -gt 0 ]; then
+            echo "检测到其它活跃 v3 run（${OTHER} 个），跳过本次续训以免分叉。"
+            CONTINUE=false
+          fi
+          # 停止开关：仓库变量 STOP_V3 置位，或根存在 STOP_V3 文件 → 停训不发版
+          if [ -n "${STOP_V3:-}" ] || [ -f STOP_V3 ]; then
+            echo "STOP_V3 置位：停止续训，不发版。"
             CONTINUE=false
           fi
 
