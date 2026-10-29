@@ -98,9 +98,12 @@ def save_clock(clk):
 
 
 def save_checkpoint(model, opt, step, loss, run_lm, tokens_this_run, clk, atomic=True):
-    """原子存档：先写临时文件再 rename，避免 CI 被回收时留下半截损坏文件。"""
+    """原子存档：先写临时文件再 rename，避免 CI 被回收时留下半截损坏文件。
+    注意：不持久化 optimizer 状态——checkpoint 体积从 ~958MB 降到 ~320MB，CI 写盘快 3 倍；
+    CPU 小模型的 AdamW momentum 在续训几百步内重建，影响可忽略。
+    """
     os.makedirs("checkpoints", exist_ok=True)
-    payload = {"model": model.state_dict(), "opt": opt.state_dict(),
+    payload = {"model": model.state_dict(),
                "step": step, "loss": float(loss),
                "ppl": float(math.exp(min(run_lm, 20))) if run_lm is not None else float("nan"),
                "args": {"last_save_tokens": tokens_this_run}}
@@ -123,6 +126,8 @@ def main():
                     help="单轮训练软时限（分钟）；到点优雅停止并保存。务必小于 CI 硬限与平台回收边界。")
     ap.add_argument("--save_every", type=float, default=10,
                     help="周期存档间隔（分钟）；CI 被回收/取消时最多丢这一段，下轮 resume 接上")
+    ap.add_argument("--allow_download", action="store_true",
+                    help="允许下载公开语料增强（默认关闭：CI 稳定优先，只用内置高质量 seed；")
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
@@ -134,13 +139,14 @@ def main():
     signal.signal(signal.SIGTERM, _on_term)
 
     torch.manual_seed(42)
-    # 构建/复用语料（内置 seed + 可选下载增强）；resume 时若 data/ 已存在可直接复用
-    build_corpus_v3.build(args.seq_len)
+    # 构建/复用语料：默认不下载（CI 稳定优先，只用内置高质量 seed + corpus artifact 复用）；
+    # 本地/手动可开 --allow_download 增强。resume 时若 data/v3_*.bin 已存在则跳过构建。
+    build_corpus_v3.build(args.seq_len, allow_download=args.allow_download)
     sampler = MixedSampler(args.seq_len)
 
     model = MoleculeV3(vocab_size=VOCAB)
     n_params = model.num_params() / 1e6
-    print("[model] v3 基础模型参数: %.1fM（15 组权重共享，纯骨干）" % n_params)
+    print("[model] v3 基础模型参数: %.1fM（15 组权重共享，纯骨干）" % n_params, flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.01)
 
@@ -148,9 +154,15 @@ def main():
     if args.resume and os.path.exists(CKPT):
         st = torch.load(CKPT, map_location="cpu", weights_only=False)
         model.load_state_dict(st["model"])
-        opt.load_state_dict(st["opt"])
         step0 = st.get("step", 0)
-        print("[resume] 从 step %d 续训" % step0)
+        # 不持久化 optimizer 状态（checkpoint 体积极大且续训重建 momentum 影响极小）；
+        # 若旧 ckpt 含 opt 则尽量复用，否则重建（保持兼容）。
+        if "opt" in st:
+            try:
+                opt.load_state_dict(st["opt"])
+            except Exception:
+                pass
+        print("[resume] 从 step %d 续训" % step0, flush=True)
     model.train()
 
     t_start = time.time()

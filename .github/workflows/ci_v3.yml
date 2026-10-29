@@ -93,7 +93,7 @@ jobs:
         env:
           OMP_NUM_THREADS: "4"
         run: |
-          timeout 80m python train_v3.py \
+          timeout 80m python -u train_v3.py \
             --seq_len "${{ inputs.seq_len || '256' }}" \
             --batch "${{ inputs.batch || '4' }}" \
             --max_minutes "${{ inputs.max_minutes || '75' }}" \
