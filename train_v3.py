@@ -124,8 +124,8 @@ def main():
     ap.add_argument("--lr", type=float, default=PEAK_LR)
     ap.add_argument("--max_minutes", type=float, default=75,
                     help="单轮训练软时限（分钟）；到点优雅停止并保存。务必小于 CI 硬限与平台回收边界。")
-    ap.add_argument("--save_every", type=float, default=10,
-                    help="周期存档间隔（分钟）；CI 被回收/取消时最多丢这一段，下轮 resume 接上")
+    ap.add_argument("--save_every", type=float, default=1000,
+                    help="周期存档间隔（分钟）；默认 1000=仅结尾存档一次（CI 写盘慢时避免多轮慢写拖垮单轮撞 timeout）。手动可调小以加强防取消保护")
     ap.add_argument("--allow_download", action="store_true",
                     help="允许下载公开语料增强（默认关闭：CI 稳定优先，只用内置高质量 seed；")
     ap.add_argument("--resume", action="store_true")

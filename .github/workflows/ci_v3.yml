@@ -33,9 +33,9 @@ on:
         required: false
         default: "75"
       save_every:
-        description: "周期存档间隔（分钟）"
+        description: "周期存档间隔（分钟）；默认 1000=仅结尾存档一次"
         required: false
-        default: "10"
+        default: "1000"
   repository_dispatch:
     types: [continue-v3]
 
