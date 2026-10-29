@@ -1,0 +1,72 @@
+name: molecule v3 看门狗（续训兜底）
+
+# v3 续训链兜底看门狗：训练步骤的 EXIT trap 正常会在每轮结束/被取消(SIGTERM)时自动续训；
+# 但万一遇到硬取消（trap 没来得及跑），链会断。本看门狗按 cron 巡检：若当前没有活跃(in_progress)
+# 的 v3 训练 run、且未到 10 天、且未 STOP_V3、且最近一次 run 不是「0 训练量失败」（避免空转分叉），
+# 则补发 continue-v3，保证链自愈、10 天训练不中断。
+#
+# 与训练链的去重：仅在「无活跃 run」时才发，不会与正常续训冲突/分叉。
+
+on:
+  schedule:
+    # 每 20 分钟巡检一次（GitHub cron 可能延迟，仅作兜底，正常续训不依赖它）
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STOP_V3: ${{ vars.STOP_V3 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 巡检并兜底续训
+        run: |
+          set -uo pipefail
+          WF="molecule v3 基础模型 · 续训 / 发版（CPU）"
+
+          # 1) 有活跃(in_progress 或 queued) run 就跳过（去重，避免与正常续训分叉；queued 覆盖刚派发尚未启动的窗口）
+          ACTIVE=$(gh run list --workflow "$WF" --limit 5 \
+                    --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
+          if [ "${ACTIVE:-0}" -gt 0 ]; then
+            echo "有 ${ACTIVE} 个活跃/排队 v3 run，看门狗跳过。"
+            exit 0
+          fi
+
+          # 2) STOP_V3 置位则不续训
+          if [ -n "${STOP_V3:-}" ]; then
+            echo "STOP_V3 置位，看门狗不续训。"
+            exit 0
+          fi
+
+          # 3) 读累计训练小时（从滚动发布 v3-checkpoint 的 v3_clock.json）
+          HOURS=0
+          if gh release view v3-checkpoint >/dev/null 2>&1; then
+            gh release download v3-checkpoint -p "v3_clock.json" -D /tmp/v3wd 2>/dev/null || true
+          fi
+          if [ -f /tmp/v3wd/v3_clock.json ]; then
+            HOURS=$(python -c "import json;print(round(json.load(open('/tmp/v3wd/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
+          fi
+          echo "累计训练小时: $HOURS / 240（10 天）"
+          if [ "${HOURS%.*}" -ge 240 ] 2>/dev/null; then
+            echo "已达 10 天，看门狗不续训（应由 Release gate 发版）。"
+            exit 0
+          fi
+
+          # 4) 最近一次 run 若是「失败」且时钟仍为 0（空转失败，如首轮 Resume 失败）→ 不空转续训
+          LAST=$(gh run list --workflow "$WF" --limit 1 \
+                  --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
+          if [ "$LAST" = "failure" ] && [ "${HOURS}" = "0" ]; then
+            echo "最近一次 run 失败且时钟=0，看门狗不空转续训（请排查失败原因）。"
+            exit 0
+          fi
+
+          # 5) 兜底续训
+          echo "看门狗：无活跃 run 且未到 10 天，补发 continue-v3。"
+          gh api repos/$GITHUB_REPOSITORY/dispatches -f event_type=continue-v3
