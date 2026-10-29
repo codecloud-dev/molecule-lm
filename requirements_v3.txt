@@ -1,0 +1,4 @@
+# v3.0 基础模型 CI 专用依赖（精简，不含旧链冗余的 transformers/gradio，加速安装 + 降低失败率）
+torch>=2.1
+numpy>=1.24
+gguf>=0.9.0

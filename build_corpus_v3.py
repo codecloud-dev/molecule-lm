@@ -105,7 +105,30 @@ def build_bins(tk, seq_len, allow_download, min_seqs_per_domain=400):
     return total_tokens
 
 
+def _bins_match_seqlen(seq_len):
+    """复用前校验：每个域的 bin 行数须为当前 seq_len 的整数倍，否则重建。"""
+    for d in DOMAINS:
+        p = "data/v3_%s.bin" % d
+        if not os.path.exists(p):
+            return False
+        try:
+            n = os.path.getsize(p) // 4
+            if n == 0 or n % seq_len != 0:
+                return False
+        except Exception:
+            return False
+    return True
+
+
 def build(seq_len, allow_download=True):
+    # resume 场景：若 4 个域的 bin 都已存在且长度匹配（从 corpus-v3 artifact 复用），直接跳过，省 1-2 分钟
+    if _bins_match_seqlen(seq_len):
+        total = 0
+        for d in DOMAINS:
+            arr = np.memmap("data/v3_%s.bin" % d, dtype=np.int32, mode="r")
+            total += arr.shape[0]
+        print("[build] 复用已有 v3_*.bin（%d seqs，seq_len=%d 匹配），跳过构建" % (total, seq_len))
+        return total
     t0 = time.time()
     tk = get_tokenizer()
     print("[tok] BPE merges: %d" % len(tk.merges))
