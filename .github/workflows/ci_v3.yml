@@ -51,6 +51,14 @@ permissions:
   contents: write
   actions: write        # 续训自触发 repository_dispatch 需要 actions:write（否则 403）
 
+# 并发上限：同一时刻最多 1 个 v3 训练 run。这是 914 跑雪崩的核心防线——
+# 没有它时几百个 run 并发会把 GitHub Actions 的 action 解析服务压垮
+#（"Unable to resolve action actions/checkout@v4"），进而每个 run 崩在 setup，
+# 又被续训逻辑补发，形成「崩→触发→再崩」死循环。串行执行后永远不可能堆出并发炸弹。
+concurrency:
+  group: v3-continous-train
+  cancel-in-progress: false
+
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -102,6 +110,7 @@ jobs:
           OMP_NUM_THREADS: "4"
           GH_TOKEN: ${{ github.token }}
           STOP_V3: ${{ vars.STOP_V3 }}
+          V3_PAUSE: ${{ vars.V3_PAUSE }}
         run: |
           set -uo pipefail
           # 续训触发（抗取消核心）：训练进程【正常结束】或【优雅 SIGTERM 退出】都会跑本 trap。
@@ -118,6 +127,9 @@ jobs:
             fi
             if [ -n "${STOP_V3:-}" ] || [ -f STOP_V3 ]; then
               echo "[continue] STOP_V3 置位，不续训。"; return 0
+            fi
+            if [ -n "${V3_PAUSE:-}" ]; then
+              echo "[continue] V3_PAUSE 置位（熔断），不续训。"; return 0
             fi
             if [ "${HOURS}" = "0" ]; then
               echo "[continue] 本轮无有效训练(clock=0)，不续训，避免空转分叉。"; return 0

@@ -1,15 +1,21 @@
 name: molecule v3 看门狗（续训兜底）
 
-# v3 续训链兜底看门狗：训练步骤的 EXIT trap 正常会在每轮结束/被取消(SIGTERM)时自动续训；
-# 但万一遇到硬取消（trap 没来得及跑），链会断。本看门狗按 cron 巡检：若当前没有活跃(in_progress)
-# 的 v3 训练 run、且未到 10 天、且未 STOP_V3、且最近一次 run 不是「0 训练量失败」（避免空转分叉），
-# 则补发 continue-v3，保证链自愈、10 天训练不中断。
+# v3 续训链兜底看门狗（炸弹防护版）。
 #
-# 与训练链的去重：仅在「无活跃 run」时才发，不会与正常续训冲突/分叉。
+# 设计纪律（直接回应 914-run 雪崩事故）：
+#   正常续训由「训练步骤 EXIT trap」负责。本看门狗只做【兜底】，且必须是炸弹安全的：
+#   ① 仅当【上轮失败/取消】且【确有训练进度(HOURS 比基线高)】时才补发 continue-v3；
+#      上轮成功 → 已由 trap 续上，看门狗跳过，绝不重复派发。
+#   ② 上轮无训练进度（典型：setup 阶段就崩、啥都没训）→ 不续训，只计入连续失败计数；
+#      连续 3 轮无进度 → 自动设 V3_PAUSE 熔断，链彻底停下，等人工排查，绝不空转到 914 跑。
+#   ③ V3_PAUSE / STOP_V3 任一置位即停。
+#   ④ 有活跃/排队 run 即跳过（去重，不与正常续训分叉；concurrency 组已保证串行）。
+#
+# 状态存于滚动发布 v3-checkpoint 的 v3_state.json：{baseline_minutes, consecutive_failures}。
 
 on:
   schedule:
-    # 每 20 分钟巡检一次（GitHub cron 可能延迟，仅作兜底，正常续训不依赖它）
+    # 每 20 分钟巡检一次（仅作兜底，正常续训不依赖它）
     - cron: "*/20 * * * *"
   workflow_dispatch: {}
 
@@ -24,49 +30,70 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       STOP_V3: ${{ vars.STOP_V3 }}
+      V3_PAUSE: ${{ vars.V3_PAUSE }}
     steps:
       - uses: actions/checkout@v4
-      - name: 巡检并兜底续训
+      - name: 巡检并兜底续训（炸弹安全：仅上轮失败且有进度才续；3 轮无进度熔断）
         run: |
           set -uo pipefail
           WF="molecule v3 基础模型 · 续训 / 发版（CPU）"
 
-          # 1) 有活跃(in_progress 或 queued) run 就跳过（去重，避免与正常续训分叉；queued 覆盖刚派发尚未启动的窗口）
+          # 0) 熔断 / 停止开关：任一置位即停
+          if [ -n "${V3_PAUSE:-}" ]; then
+            echo "V3_PAUSE 置位（熔断），看门狗不续训。"; exit 0
+          fi
+          if [ -n "${STOP_V3:-}" ]; then
+            echo "STOP_V3 置位，看门狗不续训。"; exit 0
+          fi
+
+          # 1) 有活跃(in_progress 或 queued) run 就跳过（去重；concurrency 组已保证串行）
           ACTIVE=$(gh run list --workflow "$WF" --limit 5 \
                     --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
           if [ "${ACTIVE:-0}" -gt 0 ]; then
-            echo "有 ${ACTIVE} 个活跃/排队 v3 run，看门狗跳过。"
-            exit 0
+            echo "有 ${ACTIVE} 个活跃/排队 v3 run，看门狗跳过。"; exit 0
           fi
 
-          # 2) STOP_V3 置位则不续训
-          if [ -n "${STOP_V3:-}" ]; then
-            echo "STOP_V3 置位，看门狗不续训。"
-            exit 0
-          fi
-
-          # 3) 读累计训练小时（从滚动发布 v3-checkpoint 的 v3_clock.json）
-          HOURS=0
+          # 2) 读累计训练小时 + 状态（滚动发布 v3-checkpoint）
+          HOURS=0; BASE=0; FAILS=0
+          mkdir -p /tmp/v3wd
           if gh release view v3-checkpoint >/dev/null 2>&1; then
             gh release download v3-checkpoint -p "v3_clock.json" -D /tmp/v3wd 2>/dev/null || true
+            gh release download v3-checkpoint -p "v3_state.json" -D /tmp/v3wd 2>/dev/null || true
           fi
           if [ -f /tmp/v3wd/v3_clock.json ]; then
             HOURS=$(python -c "import json;print(round(json.load(open('/tmp/v3wd/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
           fi
+          if [ -f /tmp/v3wd/v3_state.json ]; then
+            BASE=$(python -c "import json;print(round(json.load(open('/tmp/v3wd/v3_state.json')).get('baseline_minutes',0.0),2))" 2>/dev/null || echo 0)
+            FAILS=$(python -c "import json;print(int(json.load(open('/tmp/v3wd/v3_state.json')).get('consecutive_failures',0)))" 2>/dev/null || echo 0)
+          fi
           echo "累计训练小时: $HOURS / 240（10 天）"
           if [ "${HOURS%.*}" -ge 240 ] 2>/dev/null; then
-            echo "已达 10 天，看门狗不续训（应由 Release gate 发版）。"
-            exit 0
+            echo "已达 10 天，看门狗不续训（应由 Release gate 发版）。"; exit 0
           fi
 
-          # 4) 最近一次 run 若是「失败」且时钟仍为 0（空转失败，如首轮 Resume 失败）→ 不空转续训
+          # 3) 上轮成功 → 续训已由训练步骤 EXIT trap 处理，看门狗不重复派发
           LAST=$(gh run list --workflow "$WF" --limit 1 \
                   --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
-          if [ "$LAST" = "failure" ] && [ "${HOURS}" = "0" ]; then
-            echo "最近一次 run 失败且时钟=0，看门狗不空转续训（请排查失败原因）。"
-            exit 0
+          if [ "$LAST" = "success" ]; then
+            echo "上轮成功，续训已由训练 EXIT trap 处理，看门狗跳过。"; exit 0
           fi
 
-          # 5) 兜底续训
-          echo "看门狗：无活跃 run 且未到 10 天，补发 continue-v3。"
-          gh api repos/$GITHUB_REPOSITORY/dispatches -f event_type=continue-v3
+          # 4) 进度判定：是否比基线有新训练；无进度（典型 setup 崩、啥没训）不续训，防空转炸弹
+          PROGRESSED=$(python -c "print(1 if $HOURS > $BASE + 0.01 else 0)" 2>/dev/null || echo 0)
+          if [ "$PROGRESSED" = "1" ]; then
+            python -c "import json;json.dump({'baseline_minutes':$HOURS,'consecutive_failures':0},open('/tmp/v3wd/v3_state.json','w'))"
+            gh release upload v3-checkpoint --clobber /tmp/v3wd/v3_state.json 2>/dev/null || true
+            echo "看门狗：上轮有训练进度，补发 continue-v3。"
+            gh api repos/$GITHUB_REPOSITORY/dispatches -f event_type=continue-v3
+          else
+            FAILS=$((FAILS+1))
+            python -c "import json;json.dump({'baseline_minutes':$BASE,'consecutive_failures':$FAILS},open('/tmp/v3wd/v3_state.json','w'))"
+            gh release upload v3-checkpoint --clobber /tmp/v3wd/v3_state.json 2>/dev/null || true
+            if [ "${FAILS:-0}" -ge 3 ]; then
+              echo "连续 ${FAILS} 轮无训练进度（疑似 setup/环境问题），看门狗自动熔断：设 V3_PAUSE。请人工排查后再删 V3_PAUSE 恢复。"
+              gh variable set V3_PAUSE --body "1" || true
+            else
+              echo "上轮无训练进度（${FAILS}/3），看门狗暂不续训，避免空转炸弹。"
+            fi
+          fi
