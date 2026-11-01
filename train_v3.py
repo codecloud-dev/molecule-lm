@@ -203,8 +203,10 @@ def main():
     model = MoleculeV3(vocab_size=VOCAB)
     n_params = model.num_params() / 1e6
     print("[model] v3 基础模型参数: %.1fM（15 组权重共享，纯骨干）" % n_params, flush=True)
+    # foreach=False 显著降低 AdamW 峰值显存（融合算子会额外分配缓冲），
+    # 在 8GB cgroup 上限的沙箱里是能否跑过多步的关键；不改变数学结果。
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                            weight_decay=0.01)
+                            weight_decay=0.01, foreach=False)
 
     step0 = 0
     if args.resume and os.path.exists(CKPT):

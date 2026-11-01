@@ -13,6 +13,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 ALPHA_DEEPNORM = 2.78
 MTP_WEIGHT = 0.3
@@ -257,12 +258,12 @@ class MoleculeV3(nn.Module):
 
     def forward(self, idx, targets=None):
         x = self.embed(idx) * math.sqrt(self.d_model)
+        # 梯度检查点：不在前向保存每层中间激活，反向时重算，把训练期显存从 ~5GB 降到 ~1.5GB，
+        # 使 79.9M 模型能在 8GB cgroup 上限的 CPU 环境训练（否则 step2 即 OOM）。
         for p in range(self.n_layers):
             kind, gid = self.plan[p]
-            if kind == "m":
-                x = x + ALPHA_DEEPNORM * self.mamba_blocks[gid](x)
-            else:
-                x = self.attn_blocks[gid](x)
+            blk = self.mamba_blocks[gid] if kind == "m" else self.attn_blocks[gid]
+            x = x + ALPHA_DEEPNORM * checkpoint(blk, x, use_reentrant=False)
         x = self.norm_out(x)
         logits = F.linear(x, self.lm_head.weight)
         out = {"logits": logits}
