@@ -219,6 +219,49 @@ def test_dom_concentration_balance():
     print("  ✓ 域内均衡生效，且 formal 上限未被顶破")
 
 
+def test_wide_cap_encyclopedic():
+    """【第 2 条动作】规范书面语 + 百科（宽口径）合计必须有硬上限，
+    且 encyclopedia 域（课程指定预算）不可被砍。"""
+    print("=" * 70)
+    print("[T9] 宽口径（formal + 百科）上限")
+    # 【物理可达性】encyclopedia 域的域权重 = 课程指定预算，
+    # 它本身全部是 encyclopedic → 宽口径至少 = 该域权重。
+    # 真实配比里 encyclopedia 域权重 3.67%，所以这里取 5%，
+    # 保证上限 12% 在数学上可达（否则测的是"不可达"而非"裁剪逻辑"）。
+    dom_weights = G.effective_domain_weights([
+        {"frac": 1.0, "mix": {"zh_general": 0.95, "encyclopedia": 0.05}},
+    ])
+    docs, tok = [], {}
+    # encyclopedia 域：20 篇百科
+    for i in range(20):
+        did = "e%d" % i
+        docs.append(_mk(did, "百科源", "encyclopedia", "encyclopedic",
+                        "北京，简称京，是中华人民共和国的首都。"))
+        tok[did] = 1000
+    # zh_general 域：大量"百科腔"通用网页（被误判成 encyclopedic）
+    for i in range(200):
+        did = "z%d" % i
+        docs.append(_mk(did, "网页源", "zh_general", "encyclopedic",
+                        "某某事物，是某领域的一种重要现象，位于江苏省某市。"))
+        tok[did] = 1000
+    for i in range(100):
+        did = "g%d" % i
+        docs.append(_mk(did, "通用源", "zh_general", "general",
+                        "今天天气不错，街上人来人往，说了些日常琐事。"))
+        tok[did] = 1000
+    sh = G.compute_shares(docs, tok, dom_weights)
+    print("  裁剪前宽口径 %.2f%%" % (sh["formal_wide_eff_share"] * 100))
+    assert sh["formal_wide_eff_share"] > 0.12, "构造时应超标"
+    kept, rep = G.enforce_caps(docs, tok, dom_weights, source_cap=0.005,
+                                formal_cap=0.10, wide_cap=0.12, verbose=True)
+    assert rep["final_formal_wide_eff_share"] <= 0.12 + 1e-6, "宽口径上限未达标"
+    # encyclopedia 域必须保留
+    n_ency = sum(1 for d in kept if d["dom"] == "encyclopedia")
+    assert n_ency > 0, "encyclopedia 域（课程指定预算）不该被砍空"
+    print("  ✓ 宽口径达标 %.2f%%，encyclopedia 域保留 %d 篇"
+          % (rep["final_formal_wide_eff_share"] * 100, n_ency))
+
+
 def test_report_render():
     print("=" * 70)
     print("[T5] 报告渲染")
@@ -242,6 +285,7 @@ if __name__ == "__main__":
     test_dilution_makes_formal_cap_reachable()
     test_pure_formal_domain_reported_not_destroyed()
     test_dom_concentration_balance()
+    test_wide_cap_encyclopedic()
     test_report_render()
     print("=" * 70)
     print("corpus_govern 自测全部通过")

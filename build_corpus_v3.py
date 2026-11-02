@@ -858,6 +858,11 @@ MIN_NONFORMAL_FRAC = 0.25   # 域内非 formal 内容至少保留域总量的这
 # 配额上限（用户口径）
 SOURCE_CAP_FRAC = 0.005      # 单一来源 ≤ 0.5%（训练 token 流口径，数据集级）
 FORMAL_CAP_FRAC = 0.10       # 规范书面语/公文/新闻通稿合计 ≤ 10%
+WIDE_CAP_FRAC = 0.12         # 规范书面语 + 百科条目（宽口径）合计 ≤ 12%
+                             # 用户第 2 条动作：党媒 5% 但和政府网/百科/规范书面语
+                             # 合计实际可能 15%–20% → 宽口径也要有硬上限。
+                             # 注意 encyclopedia 域的 3.67% 是课程指定预算，不可砍，
+                             # 所以下限至少 3.67%，10%~12% 之间取 12%。
 TEMPLATE_MAX_SHARE = 0.05    # 单一"段首 n-gram 模板"在单源内 token 份额上限
 DOM_MAX_GROUP_SHARE = 0.60   # 单一数据集在【域内】的 token 份额上限（域内均衡）
 TRAIN_BUDGET_TOKENS = 100e9  # 训练预算（100B token）→ 用于算域重复率诊断
@@ -919,7 +924,7 @@ def build_governed_corpus(allow_download, tk=None, verbose=True):
         kept, tok, dom_weights,
         source_cap=SOURCE_CAP_FRAC, formal_cap=FORMAL_CAP_FRAC,
         min_domain_tokens=floors, dom_max_group_share=DOM_MAX_GROUP_SHARE,
-        verbose=verbose)
+        wide_cap=WIDE_CAP_FRAC, verbose=verbose)
 
     # ---- 7) 按域切分 → 构造 ChatML → 混排 ----
     by_dom = defaultdict(list)
@@ -1053,7 +1058,7 @@ def build_bins(tk, seq_len, allow_download, min_seqs_per_domain=400,
 # 语料配方版本戳：治理逻辑 / 配比 / 源配方 任一变化都必须递增，
 # 否则 CI 会复用旧的 v3_*.bin（resume 省时），新治理逻辑根本不生效——
 # 这是最容易踩的坑：代码改了，训练用的还是三个月前的语料。
-CORPUS_RECIPE_VERSION = "2026-11-02.2"
+CORPUS_RECIPE_VERSION = "2026-11-02.3"
 
 
 def _corpus_stamp_path():

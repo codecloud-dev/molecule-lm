@@ -339,20 +339,49 @@ _FORMAL_SIGNALS = re.compile(
     r"本报讯|新华社记者|本报记者|通讯员|新闻发言人|"
     r"第一，|第二，|第三，|一是要|二是要|三是要|"
     r"以习近平|党的二十大|二十届三中|全会精神| Leitung)")
-_ENCY_SIGNALS = re.compile(r"(，简称|又名| refers to |，是指|属于.{0,6}科|位于.{0,20}省|字[，。]|号[，。])")
+# 强百科信号：明确的定义/条目结构（可在任何域触发）
+_ENCY_STRONG = re.compile(
+    r"(，简称|，又名| refers to |，是指|，指的是"
+    r"|^#{1,3}\s|词条|条目简介"
+    r"|位于[^。！？\n]{2,20}(省|市|县|自治区)[，。]\s*(是|为)"
+    r"|（[^）]{1,20}），?(又称|简称|别名)"
+    r")"
+)
+
+# 【百科信号】必须足够特异。原来的弱信号（"位于…省"、"字，"）会把
+# SkyPile 的通用中文网页大量误判成百科体 → zh_general 域内凭空多出 6.6%
+# 的百科占比（训练流 15.83% 宽口径超标）。判错的代价是：
+# 真实通用网页被当成"高度同质的百科条目"对待 → 误杀多样性。
+# 现在要求：明确的定义句式 / 明确的条目结构 / 明确的条目导语。
+_ENCY_SIGNALS = re.compile(
+    r"(，简称|，又名| refers to |，是指|，指的是"
+    r"|^[^。！？\n]{2,20}(，是|是)[^。！？\n]{0,8}(一种|一类|一座|一个|一位|一部|一首)"
+    r"|^#{1,3}\s|词条|条目简介|维基百科"
+    r"|位于[^。！？\n]{2,20}(省|市|县|自治区)[，。]\s*(是|为)"
+    r"|（[^）]{1,20}），?(又称|简称|别名)"
+    r")"
+)
 
 
 def classify_regime(src_regime, text, dom=""):
     """文体归类：源级标注优先；无标注时用文本信号兜底。
 
     返回 REGIMES 之一。
+
+    【百科判定的域约束】encyclopedia 域专供百科条目，其余域里的"百科腔"
+    文本其实是通用网页——判成 encyclopedic 会让"高度同质的百科条目"
+    这个软告警类被凭空做大，进而误杀多样性。所以：
+      - encyclopedia 域 → 全部 encyclopedic（域本身就是百科域）
+      - 其他域 → 只有【强定义句式】才判 encyclopedic，弱信号不足以定性。
     """
     if src_regime:
         return src_regime
     t = text or ""
     if _FORMAL_SIGNALS.search(t):
         return "official"
-    if _ENCY_SIGNALS.search(t):
+    if dom == "encyclopedia":
+        return "encyclopedic"
+    if _ENCY_STRONG.search(t):
         return "encyclopedic"
     if dom == "code":
         return "technical"
@@ -608,7 +637,7 @@ def template_dedupe(docs, tok, head_n=8, max_share=0.05, verbose=True):
     return kept, report
 def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
                  exempt=EXEMPT_SOURCES, min_domain_tokens=None, max_iter=40,
-                 dom_max_group_share=None, verbose=True):
+                 dom_max_group_share=None, wide_cap=None, verbose=True):
     """配额求解：把超限的文档裁掉，直到训练 token 流满足上限。
 
       source_cap  : 单一来源在训练 token 流中的占比上限（默认 0.5%）
@@ -673,9 +702,16 @@ def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
         return c
 
     def dom_nonformal_now():
+        """域内【真稀释剂】的 token 量。
+
+        注意口径：百科条目（encyclopedic）虽然不在 FORMAL_REGIMES 里，
+        但它和公文/新闻一样是"高度同质的受限类" → 不能算稀释剂。
+        否则裁剪宽口径时会被自己的稀释底座挡住（删不动）。
+        稀释剂只包括 general / narrative / technical / academic / educational。
+        """
         n = defaultdict(float)
         for d in alive.values():
-            if d["regime"] not in FORMAL_REGIMES:
+            if d["regime"] not in (FORMAL_REGIMES + WATCH_REGIMES):
                 n[d["dom"]] += float(tok.get(d["id"], 0))
         return n
 
@@ -695,7 +731,8 @@ def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
             return False
         if cur_cnt.get(dom, 0) <= 1:
             return False
-        if cur_nonformal is not None and d["regime"] not in FORMAL_REGIMES:
+        if cur_nonformal is not None and \
+                d["regime"] not in (FORMAL_REGIMES + WATCH_REGIMES):
             nf = cur_nonformal.get(dom, 0.0)
             need = min(nf, max(0.0, (cur_dom[dom] - t_doc)) * DILUTION_FRAC)
             if nf - t_doc < need:
@@ -851,7 +888,7 @@ def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
                 killed += 1
                 cur_dom[dom] -= t_doc
                 cur_cnt[dom] -= 1
-                if d["regime"] not in FORMAL_REGIMES:
+                if d["regime"] not in (FORMAL_REGIMES + WATCH_REGIMES):
                     cur_nf[dom] -= t_doc
                 progressed = True
             if not progressed:
@@ -932,7 +969,7 @@ def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
                 dropped.append(d)
                 cur_dom[dom] -= t_doc
                 cur_cnt[dom] -= 1
-                if d["regime"] not in FORMAL_REGIMES:
+                if d["regime"] not in (FORMAL_REGIMES + WATCH_REGIMES):
                     cur_nf[dom] -= t_doc
                 killed += 1
             if killed == 0:
@@ -1037,7 +1074,7 @@ def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
                     dropped.append(d)
                     cur_dom[dom] -= t_doc
                     cur_cnt[dom] -= 1
-                    if d["regime"] not in FORMAL_REGIMES:
+                    if d["regime"] not in (FORMAL_REGIMES + WATCH_REGIMES):
                         cur_nf[dom] -= t_doc
                     cur_grp -= t_doc
                     tok_dom[dom] -= t_doc
@@ -1056,6 +1093,77 @@ def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
                 break
         return killed_total, blocked
 
+    def trim_wide(cap):
+        """压"规范书面语 + 百科条目"的【宽口径】合计到 ≤cap。
+
+        用户第 2 条动作明确点了这个：配比表上写"党媒 5%"，但和它功能重叠的
+        源（政府网 / 百科 / 规范书面语）加起来实际可能 15%–20%。
+        formal 硬上限（10%）只管 official+news，管不住 encyclopedic。
+        而 encyclopedia 域是【课程指定的独立预算】（3.67%），不能砍——
+        砍了就把课程配比改了。所以这里只压：
+            【非 encyclopedia 域】里被判成 encyclopedic 的内容
+        （通用网页里的"百科腔"条目，功能上与百科条目重叠，
+          是第 2 条动作里"你以为的占比"的主要来源之一）。
+        返回删除数
+        """
+        killed_total = 0
+        for _round in range(max_iter):
+            alive_docs = list(alive.values())
+            sh = compute_shares(alive_docs, tok, dom_weights)
+            if sh["formal_wide_eff_share"] <= cap * 1.001:
+                break
+            wide_docs = [d for d in alive_docs
+                         if d["regime"] in (FORMAL_REGIMES + WATCH_REGIMES)
+                         and d["dom"] != "encyclopedia"
+                         and d["src"] not in exempt and d["id"] in alive]
+            if not wide_docs:
+                break
+            by_dom = defaultdict(list)
+            for d in wide_docs:
+                by_dom[d["dom"]].append(d)
+            dom_info = sh["dom_formal"]
+            deletable = []
+            for dom, ds in by_dom.items():
+                info = dom_info.get(dom)
+                if info and info["total"] > 0 and info["formal_frac"] >= 0.999:
+                    continue      # 纯 formal 域删不动
+                deletable.extend(ds)
+            if not deletable:
+                break
+            by_src = defaultdict(list)
+            for d in deletable:
+                by_src[d["src"]].append(d)
+            for v in by_src.values():
+                v.sort(key=drop_priority)
+            order, srcs = [], sorted(by_src)
+            i = 0
+            while any(by_src[s] for s in srcs):
+                s = srcs[i % len(srcs)]
+                if by_src[s]:
+                    order.append(by_src[s].pop(0))
+                i += 1
+            n_kill = max(1, len(order) // 8)
+            cur_dom = dom_tokens_now()
+            cur_cnt = dom_doc_count()
+            cur_nf = dom_nonformal_now()
+            killed = 0
+            for d in order[:n_kill]:
+                if not can_delete(d, cur_dom, cur_cnt, cur_nf):
+                    continue
+                dom = d["dom"]
+                t_doc = float(tok.get(d["id"], 0))
+                alive.pop(d["id"], None)
+                dropped.append(d)
+                cur_dom[dom] -= t_doc
+                cur_cnt[dom] -= 1
+                if d["regime"] not in (FORMAL_REGIMES + WATCH_REGIMES):
+                    cur_nf[dom] -= t_doc
+                killed += 1
+            if killed == 0:
+                break
+            killed_total += killed
+        return killed_total
+
     for _it in range(max_iter):
         alive_docs = list(alive.values())
         sh = compute_shares(alive_docs, tok, dom_weights)
@@ -1066,6 +1174,13 @@ def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
             if killed:
                 continue
             # 删不动 → 如实报告"需稀释"，不砍空语料
+            break
+
+        # --- 1.5) 治"规范书面语 + 百科"宽口径超标（第 2 条动作的核心）---
+        if wide_cap is not None and sh["formal_wide_eff_share"] > wide_cap * 1.001:
+            killed = trim_wide(wide_cap)
+            if killed:
+                continue
             break
 
         # --- 2) 域内集中度均衡（用 formal 余量换来源多样性）---
@@ -1160,6 +1275,7 @@ def enforce_caps(docs, tok, dom_weights, source_cap=0.005, formal_cap=0.10,
                                           for d in {x["dom"] for x in final}}).items()},
         "over_cap_sources": [{"src": s, "share": v} for s, v in over_src],
         "over_cap_groups": [{"group": g, "share": v} for g, v in over_grp],
+        "wide_cap": wide_cap,
         "dom_max_group_share": dom_max_group_share,
         "dom_concentration_blocked": conc_blocked,
         "dom_group_share": _dom_group_share(final, tok),
