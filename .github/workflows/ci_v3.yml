@@ -164,7 +164,15 @@ jobs:
               HOURS=$(python -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
             fi
             if [ "${HOURS%.*}" -ge 240 ] 2>/dev/null; then
-              echo "[continue] 已达 10 天，不续训（交由 Release gate 发版）。"; return 0
+              # 到量了，但【质量门】可能拦住发版（PPL 未达 <10）→ 那种情况必须继续训，
+              # 否则链条会断在这里（trap 不续训 + Release gate 不发版 = 死锁）。
+              # 所以只有"到量 且 质量达标"才停训；质量不达标 → 继续训到达标。
+              PPL_NOW=$(python -c "import math,torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);p=float(s.get('ppl') or 0.0);print('%.4f'%p if (math.isfinite(p) and p>0) else '999')" 2>/dev/null || echo 999)
+              PPL_FINE=$(python -c "print(1 if float('$PPL_NOW')<10.0 else 0)")
+              if [ "$PPL_FINE" = "1" ]; then
+                echo "[continue] 已达 10 天且 PPL=$PPL_NOW 达标，不续训（交由 Release gate 发版）。"; return 0
+              fi
+              echo "[continue] 已达 10 天但 PPL=$PPL_NOW 未达 <10，质量门会拦住发版 → 继续续训直到质量达标。"
             fi
             if [ -n "${STOP_V3:-}" ] || [ -f STOP_V3 ]; then
               echo "[continue] STOP_V3 置位，不续训。"; return 0
@@ -296,7 +304,21 @@ jobs:
 
           REACHED=$(python -c "print(1 if $HOURS>=240 else 0)")
           if [ "$REACHED" -eq 1 ]; then
-            echo "已达 10 天，发版 v3.0 并停止自动续训。"
+            # 【质量门】时钟到了 != 模型能发。训练崩了（PPL 爆炸 / NaN）也会攒满 10 天，
+            # 那时发出来的是废模型。设计目标 PPL<10，必须同时达标才发版。
+            # 拿不到 PPL（checkpoint 缺失/损坏）按【不达标】处理 —— 宁可不发，不发废模型。
+            PPL=$(python -c "import math,torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);p=float(s.get('ppl') or 0.0);print('%.4f'%p if (math.isfinite(p) and p>0) else '999')" 2>/dev/null || echo 999)
+            PPL_OK=$(python -c "print(1 if float('$PPL')<10.0 else 0)")
+            echo "发版质量门：PPL=$PPL（目标 <10）"
+            if [ "$PPL_OK" != "1" ]; then
+              # 宁缺毋滥：到量但质量不达标 → 不发版。
+              # 直接退出本步骤（跳过发版主体），续训由训练步骤的 EXIT trap 负责
+              # （trap 在【进程退出时】必跑，比依赖末尾步骤可靠）。
+              echo "已达 10 天但 PPL=$PPL 未达 <10，不发版 v3.0（宁缺毋滥），继续续训直到质量达标。"
+              echo "[release] 质量门未过，跳过发版。"
+              exit 0
+            fi
+            echo "已达 10 天且 PPL=$PPL 达标，发版 v3.0 并停止自动续训。"
             TAG="v3.0"
             for f in molecule-v3-source.gguf molecule-v3.gguf; do
               if [ ! -f "$f" ]; then echo "缺少 $f，跳过发版"; CONTINUE=false; exit 0; fi
