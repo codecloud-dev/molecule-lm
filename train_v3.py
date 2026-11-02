@@ -256,13 +256,13 @@ def persist(block=False):
 
 
 def save_checkpoint(model, opt, step, loss, run_lm, tokens_this_run, clk,
-                    atomic=True, block_persist=False):
+                    atomic=True):
     """原子存档：先写临时文件再 rename，避免 CI 被回收时留下半截损坏文件。
     注意：不持久化 optimizer 状态——checkpoint 体积从 ~958MB 降到 ~320MB，CI 写盘快 3 倍；
     CPU 小模型的 AdamW momentum 在续训几百步内重建，影响可忽略。
 
-    每次存档都：① 增量累加时钟（抗取消，进度不丢）② 推到滚动发布（block_persist=True
-    时阻塞等待，用于优雅退出前的最后一笔，尽量保证这帧也落库）。
+    每次存档都：① 增量累加时钟（抗取消，进度不丢）② 同步推到滚动发布
+    （同步而非异步：异步子进程在 CI 回收 run 时常被一起收走，滚动发布会停在旧资产）。
     """
     os.makedirs("checkpoints", exist_ok=True)
     payload = {"model": model.state_dict(),
@@ -278,17 +278,11 @@ def save_checkpoint(model, opt, step, loss, run_lm, tokens_this_run, clk,
     # 增量记账（抗取消核心）：这一帧之前的实际训练分钟/ token 全部入账。
     accrue_clock(clk, tokens_this_run, step)
     save_clock(clk)
-    # 抗取消持久化：周期存档非阻塞；结尾存档阻塞等待（优雅退出前最后一笔尽量落库）。
-    if block_persist:
-        try:
-            if os.environ.get("V3_PERSIST", "1") != "0":
-                subprocess.run([sys.executable, "persist_v3.py"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=900)
-        except Exception:
-            pass
-    else:
-        persist()
+    # 抗取消持久化：同步阻塞执行。
+    # 【为何不用异步】异步 Popen 在 CI 平台回收 run 时，子进程常在上传完成前就被一起收走
+    # → 滚动发布长期停在旧资产 → 每轮都"从零开始训练"。同步能确保这一帧真的落库。
+    # 代价：每 save_every 分钟阻塞约 1-2 分钟（上传 ~90MB）。相对单轮 75 分钟可接受。
+    persist(block=True)
 
 
 def main():
@@ -403,7 +397,7 @@ def main():
     elapsed = (time.time() - t_start) / 60.0
     clk["runs"] = clk.get("runs", 0) + 1
 
-    save_checkpoint(model, opt, last_step, loss, run_lm, tokens_this_run, clk, block_persist=True)
+    save_checkpoint(model, opt, last_step, loss, run_lm, tokens_this_run, clk)
     print("[done] checkpoint -> %s | 本轮 %.1f 分钟 | 累计 %.1f 分钟 / %.1f 小时（%d 轮）"
           % (CKPT, elapsed, clk["total_minutes"], clk["total_minutes"] / 60.0, clk["runs"]))
 
