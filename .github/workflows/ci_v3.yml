@@ -110,6 +110,36 @@ jobs:
             gh release download v3-checkpoint -p "v3_corpus_stamp.txt" -D data 2>/dev/null || echo "[resume] 无语料配方戳（将重建）"
           else
             echo "无滚动检查点（首轮），从零开始训练。"
+            # 【兜底】滚动发布建不起来时，从【上一轮成功 run 的 artifact】恢复。
+            # 背景：曾因 persist_v3.py 认错 token 变量名（查 GITHUB_TOKEN，
+            # 而 CI 注入的是 GH_TOKEN）导致滚动发布从未建立，每轮都从零训练，
+            # 10 天时钟永远攒不够。artifact 是第二持久源，能兜住这类"单点失效"。
+            # 只取最近一个成功 run 的 resume-v3 / corpus-v3，取不到就真从零开始。
+            PREV=$(gh run list --workflow "molecule v3 基础模型 · 续训 / 发版（CPU）" \
+                     --status completed --conclusion success --limit 1 \
+                     --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+            if [ -n "${PREV}" ]; then
+              echo "[resume] 兜底：尝试从上一轮成功 run #${PREV} 的 artifact 恢复..."
+              gh run download "$PREV" -n resume-v3 -D /tmp/prev_resume 2>/dev/null \
+                && echo "[resume] artifact 下载成功" || echo "[resume] artifact 下载失败"
+              if [ -f /tmp/prev_resume/checkpoints/v3.pt ]; then
+                mkdir -p checkpoints && cp /tmp/prev_resume/checkpoints/v3.pt checkpoints/v3.pt
+                echo "[resume] 已恢复 checkpoint"
+              fi
+              if [ -f /tmp/prev_resume/data/v3_clock.json ]; then
+                mkdir -p data && cp /tmp/prev_resume/data/v3_clock.json data/v3_clock.json
+                echo "[resume] 已恢复训练时钟"
+              fi
+              # 语料 bin：只在上轮有配方戳匹配时才复用，否则让训练脚本重建
+              if ls /tmp/prev_resume/data/v3_*.bin >/dev/null 2>&1; then
+                mkdir -p data && cp /tmp/prev_resume/data/v3_*.bin data/ 2>/dev/null || true
+                cp /tmp/prev_resume/data/v3_corpus_stamp.txt data/ 2>/dev/null || true
+                cp /tmp/prev_resume/data/self_bpe_8192.json data/ 2>/dev/null || true
+                echo "[resume] 已尝试恢复语料（配方戳不匹配则会自动重建）"
+              fi
+            else
+              echo "[resume] 无上一轮成功 run，真从零开始。"
+            fi
           fi
           echo "--- checkpoints ---"; ls -la checkpoints 2>/dev/null | head || true
           echo "--- data ---"; ls -la data 2>/dev/null | head || true
@@ -171,7 +201,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: resume-v3
-          path: checkpoints
+          path: |
+            checkpoints
+            data/v3_clock.json
+            data/v3_midtrain.bin
           retention-days: 30
           if-no-files-found: warn
 

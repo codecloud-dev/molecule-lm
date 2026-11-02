@@ -232,15 +232,25 @@ def accrue_clock(clk, tokens_this_run, last_step):
     _counted_tokens = tokens_this_run
 
 
-def persist():
-    """把最新 checkpoint + 时钟 + 语料推到滚动发布（抗取消持久化）。非阻塞 fire-and-forget。"""
+def persist(block=False):
+    """把最新 checkpoint + 时钟 + 语料推到滚动发布（抗取消持久化）。
+
+    【P0 修复】原来用 Popen 异步 fire-and-forget：CI 平台取消 run 时，
+    父进程收到 SIGTERM 就退出，异步子进程往往还没上传完就被一起收走 →
+    滚动发布永远建立不起来，每轮都"从零开始训练"。
+    现在默认【同步阻塞】执行，保证上传真正落库；周期存档时仍可传 block=False
+    走异步（那时父进程还活着，异步更省时间）。
+    """
     try:
         if os.environ.get("V3_PERSIST", "1") == "0":
             return
-        subprocess.Popen(
-            [sys.executable, "persist_v3.py"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        cmd = [sys.executable, "persist_v3.py"]
+        if block:
+            # 阻塞等待：给足超时（checkpoint ~320MB + 语料 bin 上传可能几分钟）
+            subprocess.run(cmd, timeout=900, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 

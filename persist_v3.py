@@ -24,6 +24,9 @@ import sys
 RELEASE = "v3-checkpoint"
 LOCK = "checkpoints/.persist.lock"
 
+# gh CLI 的运行环境（注入 GH_TOKEN 后填充）。模块级，便于 _gh 统一使用。
+GH_ENV = dict(os.environ)
+
 
 def _gh(*args, timeout=60, capture=True):
     return subprocess.run(
@@ -31,6 +34,7 @@ def _gh(*args, timeout=60, capture=True):
         capture_output=capture,
         timeout=timeout,
         check=False,
+        env=GH_ENV,
     )
 
 
@@ -38,8 +42,17 @@ def main():
     # 仅在 CI 且有 token 时推送；本地冒烟跳过，避免误推。
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
-    if not os.environ.get("GITHUB_TOKEN"):
+    # 【P0 修复】CI 注入的变量名是 GH_TOKEN（gh CLI 认这个），不是 GITHUB_TOKEN。
+    # 原来只认 GITHUB_TOKEN → 抗取消持久化从未生效 → 每轮都"从零开始训练"，
+    # 10 天时钟永远攒不到 240h，v3.0 永远发不出来。两个名字都认，取其一即可。
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
         return
+    # gh CLI 读 GH_TOKEN；统一显式传给它，别依赖环境继承。
+    gh_env = dict(os.environ)
+    gh_env["GH_TOKEN"] = token
+    GH_ENV.clear()
+    GH_ENV.update(gh_env)
 
     # 避免并发上传互相 clobber：简单的文件锁，上一个还在传就跳过本轮。
     if os.path.exists(LOCK):
