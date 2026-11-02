@@ -62,11 +62,9 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    # 单轮硬限。构成：安装 ~5m + [语料重建 ~20m（仅配方版本变化后的第一轮）]
-    # + 训练 80m + 导出/上传 ~10m + 余量。
-    # 注意：语料重建发生在训练步骤【内部】（train_v3.py 先建语料再训练），
-    # 所以重建轮会吃掉训练时间 → 第一轮实际训练时长变短，属预期。
-    timeout-minutes: 150
+    # 单轮硬限预算：安装 ~5m + [语料重建 ~20m（仅配方版本变化后的第一轮）]
+    # + 训练 100m（内层软超时）+ 评测/导出 ~20m + 余量 ≈ 150m
+    timeout-minutes: 165
     steps:
       - uses: actions/checkout@v4
 
@@ -145,7 +143,11 @@ jobs:
           echo "--- data ---"; ls -la data 2>/dev/null | head || true
 
       - name: Train v3 基础模型（CPU，时间驱动停止，周期存档 + 抗取消持久化 + 续训触发）
-        timeout-minutes: 95
+        # 120m > 内层 timeout 100m：让【内层软超时】先触发，走优雅退出路径（SIGTERM handler
+        # → 存最后一帧 → 同步推滚动发布）。若外层先砍（95m），平台会给 SIGTERM，
+        # 训练进程能优雅退出，但末尾步骤可能被跳过——虽然持久化已同步化能保住 checkpoint，
+        # 仍应让内层先收口，把主动权握在自己手里。
+        timeout-minutes: 120
         continue-on-error: true
         env:
           OMP_NUM_THREADS: "4"
