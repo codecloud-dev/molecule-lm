@@ -25,6 +25,7 @@ import glob
 import os
 import subprocess
 import sys
+import time
 
 RELEASE = "v3-checkpoint"
 LOCK = "checkpoints/.persist.lock"
@@ -79,8 +80,14 @@ def main():
     GH_ENV.clear()
     GH_ENV.update(gh_env)
 
-    if os.path.exists(LOCK):
-        return
+    # 等待锁释放（最多 ~120s）：避免「异步 logs 持久化」持锁时，「同步 full 持久化（checkpoint）」
+    # 被直接 return 跳过、导致检查点没推上去——这正是此前 20 天时钟不累加的根因之一。
+    for _ in range(120):
+        if not os.path.exists(LOCK):
+            break
+        time.sleep(1)
+    else:
+        return  # 120s 仍被占，放弃本轮（下一轮存档会补）
     try:
         os.makedirs("checkpoints", exist_ok=True)
         open(LOCK, "w").close()
