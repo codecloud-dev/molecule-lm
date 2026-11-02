@@ -970,7 +970,8 @@ def build_governed_corpus(allow_download, tk=None, verbose=True):
     if verbose:
         txt = corpus_govern.render_report(shares,
                                           src_cap=SOURCE_CAP_FRAC,
-                                          formal_cap=FORMAL_CAP_FRAC)
+                                          formal_cap=FORMAL_CAP_FRAC,
+                                          wide_cap=WIDE_CAP_FRAC)
         print(txt)
         print("[gov] 模板污染：最高频段首 %r 复现 %d 次（占 %.1f%%）"
               % (tp["head_top"][0][0] if tp["head_top"] else "",
@@ -1144,7 +1145,8 @@ def build(seq_len, allow_download=True):
         if shares:
             txt = corpus_govern.render_report(shares,
                                               src_cap=SOURCE_CAP_FRAC,
-                                              formal_cap=FORMAL_CAP_FRAC)
+                                              formal_cap=FORMAL_CAP_FRAC,
+                                              wide_cap=WIDE_CAP_FRAC)
             with open("data/v3_corpus_report.txt", "w", encoding="utf-8") as f:
                 f.write(txt + "\n")
         print("[gov] 审计报告 → data/v3_corpus_report.txt / .json")

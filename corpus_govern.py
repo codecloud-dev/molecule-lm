@@ -1333,7 +1333,8 @@ def _dom_group_share(docs, tok=None):
 # ---------------------------------------------------------------------------
 # 报告渲染
 # ---------------------------------------------------------------------------
-def render_report(shares, src_cap=0.005, formal_cap=0.10, top=20):
+def render_report(shares, src_cap=0.005, formal_cap=0.10, top=20,
+                  wide_cap=None):
     """把统计结果渲染成人能读的文本（写进 data/v3_corpus_report.txt）。"""
     L = []
     A = L.append
@@ -1365,6 +1366,10 @@ def render_report(shares, src_cap=0.005, formal_cap=0.10, top=20):
     A("    %-16s 训练流 %6.2f%%  （上限 %.0f%%，%s）"
       % ("[规范书面语合计]", shares["formal_eff_share"] * 100, formal_cap * 100,
          "达标" if shares["formal_eff_share"] <= formal_cap + 1e-9 else "超标"))
+    if wide_cap is not None:
+        A("    %-16s 训练流 %6.2f%%  （上限 %.0f%%，%s）"
+          % ("[宽口径+百科]", shares["formal_wide_eff_share"] * 100, wide_cap * 100,
+             "达标" if shares["formal_wide_eff_share"] <= wide_cap + 1e-9 else "超标"))
     A("")
     A("【三】单一来源 = 【数据集级】（训练流 token 占比，上限 %.1f%%）" % (src_cap * 100))
     A("  ← 口径说明：同一数据集的多个采样单元（shard）合并计算")
