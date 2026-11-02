@@ -82,6 +82,12 @@ jobs:
         run: |
           python tests/test_offline.py
 
+      - name: 语料治理自测（跨源去重 / 文体上限 / 域内均衡 / 稀释可达）
+        timeout-minutes: 10
+        continue-on-error: false
+        run: |
+          python tools/test_corpus_govern.py
+
       - name: Resume from rolling checkpoint（v3-checkpoint 滚动发布，抗取消）
         timeout-minutes: 10
         continue-on-error: true
@@ -256,6 +262,9 @@ jobs:
             done
             {
               echo "# molecule v3.0 · 统一熔铸混合骨干（基础模型）"
+              echo
+              # 固定身份句：不写版本号、不写开发主体信息（与 v2 make_release_notes.py 同口径）
+              echo "开源语言模型·代号 molecule·由 codecloud-dev 独立开发"
               echo
               echo "v3.0 是 molecule 系列第一个可交付的基础版本：Mamba+BinaryAttention 混合线性骨干，"
               echo "24 层 Mamba 线性递推 + 6 层 BinaryAttention（4:1），640d、块级权重共享、8192 byte-level BPE、DeepNorm α=2.78、MTP + Z-loss。"

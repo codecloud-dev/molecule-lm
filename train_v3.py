@@ -3,16 +3,20 @@
 用法（本地冒烟 / CI 同一入口）：
   python train_v3.py --seq_len 256 --batch 4 --max_minutes 75 --save_every 10 --resume
 
-纪律（严格对齐设计文档 §7 / §10 / §12.1）：
+纪律（严格对齐设计文档 §7 / §10 / §12.1 + 用户课程学习口径）：
   - 这是 v3.0 基础模型：只夯骨干，什么高级功能都不接（System1/元认知/调度器/工具/记忆
     全是 v3.5+ 的事）；目标 PPL<10，能生成通顺中文即可。
-  - 数据：Phase1 配比 中文60% / 英文10% / 代码20% / 书籍10%（build_corpus_v3.py 预编码）。
+  - 课程学习（先按阶段分训练量，再在阶段内按域分比例），按【10 天训练窗口】切阶段：
+      Phase1      50%  中60/英10/代码20/书10           打语言基础
+      Phase2      40%  中30/代码30/数学25/书10/百科5    强化推理与代码
+      Mid-training 10%  困惑度过滤难样本 + 退火         精炼能力
+    数据规模设计目标：100B 高质量语料循环 3–4 epoch（TinyLlama 验证小模型过训不饱和；
+    MobileLLM-R1 验证该配比 4.2T tokens 打平 36T 训练的 Qwen3-0.6B）。实际语料不足时多 epoch。
   - 损失：L_lm + 0.3*L_mtp(位移+2) + 1e-4*Z-loss。
-  - 优化器：AdamW（矩阵参数走 Muon 为后续优化项；CPU 续训先用 AdamW 保稳定），
-    β2=0.95，weight_decay=0.01，全局梯度裁剪 1.0。
-  - 学习率：warmup 2000 步 + WSD 余弦衰减到 10%（基于【全局步数】，跨轮续训不重置）。
+  - 优化器：AdamW，β2=0.95，weight_decay=0.01，全局梯度裁剪 1.0。
+  - 学习率：warmup 2000 步 + WSD 余弦衰减到 10%；进入 Mid-training 后余弦退火到 ~1e-5。
   - 断点：checkpoints/v3.pt（model+optimizer+step）；--resume 续训。
-  - 训练时钟：data/v3_clock.json 累计 {分钟, token, 步数, 轮次}，供 10 天发版闸门使用。
+  - 训练时钟：data/v3_clock.json 累计 {分钟, token, 步数, 轮次, 阶段}，供 10 天发版闸门使用。
   - 鲁棒性：周期 flush（--save_every 分钟）保证 CI 被回收/取消时最多丢一段；SIGTERM
     优雅退出（timeout 软终止前存档），再留 5 分钟余量给存档与上传。
 """
@@ -32,54 +36,160 @@ import build_corpus_v3
 from model_v3 import MoleculeV3
 
 DOMAINS = build_corpus_v3.DOMAINS
-MIX = build_corpus_v3.MIX
+MIX = build_corpus_v3.MIX                       # 兼容：Phase1 混比
+PHASES = build_corpus_v3.PHASES
+TOTAL_BUDGET_TOKENS = build_corpus_v3.TOTAL_BUDGET_TOKENS   # 数据规模设计目标（仅记录）
 CKPT = "checkpoints/v3.pt"
 CLOCK = "data/v3_clock.json"
 VOCAB = 8192
+MIDTRAIN_BIN = "data/v3_midtrain.bin"
 
-WARMUP = 2000
-DECAY_STEPS = 20000
+# 课程阶段按【累计训练分钟】切分；10 天窗口 = 14400 分钟。
+# （100B 是数据规模设计目标，非调度驱动；阶段切分绑定到用户指定的 10 天训练窗口，
+#  保证「每个阶段吃不同搭配」在真实 CI 训练期内真正发生。）
+TRAIN_HORIZON_MIN = 10 * 24 * 60
+
+WARMUP_STEPS = 2000
 PEAK_LR = 3e-4
+# Mid-training 难样本池构建时机（步）：模型需先具备一定语言能力，此时的困惑度排序才有意义
+# （随机初始化时的困惑度近乎均匀，筛不出"难样本"）。池构建一次后持久化复用。
+MIDTRAIN_POOL_AT_STEP = 3000
 
 
-def lr_at(step, peak=PEAK_LR, warmup=WARMUP, decay_steps=DECAY_STEPS):
+def lr_at(step, cum_min, peak=PEAK_LR, warmup=WARMUP_STEPS):
+    """学习率：WSD 热身 + 阶段衰减；进入 Mid-training 后余弦退火到 ~1e-5。
+    - step：全局步数（热身基于它，跨轮续训不重置）
+    - cum_min：累计训练分钟（决定所处阶段与退火进度）
+    """
     if step < warmup:
         return peak * (step / warmup)
-    t = (step - warmup) / decay_steps
-    if t >= 1.0:
-        return peak * 0.1
-    return peak * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * t)))
+    g = min(cum_min / TRAIN_HORIZON_MIN, 1.0)
+    if g < 0.90:                       # Phase1 + Phase2：peak 余弦衰减到 0.1*peak
+        frac = g / 0.90
+        return peak * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * frac)))
+    frac = (g - 0.90) / 0.10           # Mid-training 退火：0.1*peak → 1e-5
+    return max(1e-5, 0.1 * peak * 0.5 * (1.0 + math.cos(math.pi * frac)))
 
 
-class MixedSampler:
-    """按 Phase1 域混比抽整段序列。"""
+def phase_for_minutes(cum_min):
+    """返回 (当前阶段 dict, 全局进度 g∈[0,1])。"""
+    g = min(cum_min / TRAIN_HORIZON_MIN, 1.0)
+    acc = 0.0
+    for idx, ph in enumerate(PHASES):
+        acc += ph["frac"]
+        if g < acc or idx == len(PHASES) - 1:
+            return ph, g
+    return PHASES[-1], g
 
-    def __init__(self, seq_len, seed=42):
+
+class CurriculumSampler:
+    """课程学习采样：依据累计训练分钟决定当前阶段，按阶段内域混比抽整段序列。
+    Mid-training 阶段优先从困惑度过滤出的难样本池抽取（池由 build_midtrain_pool 构建）。
+    """
+
+    def __init__(self, seq_len, seed=42, midtrain_path=MIDTRAIN_BIN):
         self.seq_len = seq_len
         self.bins = {}
         for dom in DOMAINS:
             p = "data/v3_%s.bin" % dom
             if os.path.exists(p):
                 self.bins[dom] = np.memmap(p, dtype=np.int32, mode="r").reshape(-1, seq_len)
+        self.mid = None
+        if midtrain_path and os.path.exists(midtrain_path):
+            try:
+                self.mid = np.memmap(midtrain_path, dtype=np.int32, mode="r").reshape(-1, seq_len)
+                print("[sampler] 加载 Mid-training 难样本池：%d seqs" % self.mid.shape[0])
+            except Exception:
+                # 池与当前 seq_len 不匹配（换过 seq_len）→ 放弃旧池，重建；不崩训练
+                self.mid = None
+                print("[sampler] 难样本池与 seq_len=%d 不匹配，忽略（稍后重建）" % seq_len)
         self.rng = np.random.default_rng(seed)
         self.domains = list(self.bins) or ["zh_general"]
-        self.totmix = sum(MIX.get(d, 0.25) for d in self.domains) or 1.0
 
-    def batch(self, bs):
+    def reload_midtrain(self, path=MIDTRAIN_BIN, seq_len=None):
+        """重新加载 Mid-training 难样本池（池在训练途中按困惑度构建后调用）。"""
+        if not (path and os.path.exists(path)):
+            self.mid = None
+            return False
+        try:
+            arr = np.memmap(path, dtype=np.int32, mode="r").reshape(-1, self.seq_len)
+        except Exception:
+            # seq_len 不匹配等异常 → 放弃池（退回阶段内均匀采样），不阻塞训练
+            self.mid = None
+            return False
+        self.mid = arr
+        print("[sampler] 载入 Mid-training 难样本池：%d seqs" % self.mid.shape[0])
+        return True
+
+    def batch(self, bs, cum_min):
+        ph, g = phase_for_minutes(cum_min)
+        if ph["name"] == "midtrain" and self.mid is not None:
+            xs = []
+            for _ in range(bs):
+                i = self.rng.integers(0, max(self.mid.shape[0], 1))
+                xs.append(np.asarray(self.mid[i], dtype=np.int64))
+            return torch.from_numpy(np.stack(xs))
+        mix = ph["mix"] or {d: 1.0 / max(len(self.domains), 1) for d in self.domains}
+        doms = list(mix)
+        tot = sum(mix.values()) or 1.0
         xs = []
         for _ in range(bs):
-            r = self.rng.random() * self.totmix
-            acc, pick = 0.0, self.domains[0]
-            for d in self.domains:
-                acc += MIX.get(d, 0.25)
+            r = self.rng.random() * tot
+            acc, pick = 0.0, doms[0]
+            for d in doms:
+                acc += mix[d]
                 if r <= acc:
                     pick = d
                     break
-            arr = self.bins[pick]
+            arr = self.bins[pick] if pick in self.bins else self.bins[self.domains[0]]
             i = self.rng.integers(0, max(arr.shape[0], 1))
-            seg = np.asarray(arr[i], dtype=np.int64)
-            xs.append(seg)
+            xs.append(np.asarray(arr[i], dtype=np.int64))
         return torch.from_numpy(np.stack(xs))
+
+
+def build_midtrain_pool(model, seq_len, out=MIDTRAIN_BIN, per_domain=1500, keep_frac=0.25):
+    """困惑度过滤：用当前模型对每个域抽样若干序列计算逐序列困惑度（loss_lm），
+    保留最难的 keep_frac 作为 Mid-training 难样本池。仅构建一次（存在则跳过）。
+    在 model.eval() 无梯度下运行；返回 bin 路径（未建成返回 None）。
+    """
+    if os.path.exists(out):
+        try:
+            n = os.path.getsize(out) // 4
+            if n > 0 and n % seq_len == 0:
+                print("[midtrain] 池已存在，跳过构建：%s" % out)
+                return out
+            # seq_len 变了 → 旧池作废，重建
+            os.remove(out)
+            print("[midtrain] 旧池与 seq_len=%d 不匹配，删除重建" % seq_len)
+        except Exception:
+            pass
+    seqs, losses = [], []
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for dom in DOMAINS:
+            p = "data/v3_%s.bin" % dom
+            if not os.path.exists(p):
+                continue
+            arr = np.memmap(p, dtype=np.int32, mode="r").reshape(-1, seq_len)
+            n = min(per_domain, arr.shape[0])
+            idx = np.random.default_rng(0).choice(arr.shape[0], n, replace=False)
+            for j in idx:
+                x = torch.from_numpy(np.asarray(arr[j], dtype=np.int64)).unsqueeze(0)
+                o = model(x, x)
+                losses.append(float(o["loss_lm"].item()))
+                seqs.append(np.asarray(arr[j], dtype=np.int32))
+    if was_training:
+        model.train()
+    if not seqs:
+        return None
+    order = np.argsort(losses)[::-1]                 # 从高困惑度（难）到低
+    k = max(1, int(len(order) * keep_frac))
+    sel = np.stack([seqs[i] for i in order[:k]]).astype(np.int32)
+    os.makedirs("data", exist_ok=True)
+    sel.tofile(out)
+    print("[midtrain] 选 %d/%d 最难样本 -> %s（每域抽样 %d）" % (k, len(seqs), out, per_domain))
+    return out
 
 
 def load_clock():
@@ -182,8 +292,8 @@ def main():
     ap.add_argument("--save_every", type=float, default=10,
                     help="周期存档间隔（分钟）；默认 10=每 10 分钟落一帧并推滚动发布，"
                          "抗 CI 取消：最坏只丢 10 分钟。CI 写盘慢也不撞 timeout（本地写盘快，上传非阻塞）。")
-    ap.add_argument("--allow_download", action="store_true",
-                    help="允许下载公开语料增强（默认关闭：CI 稳定优先，只用内置高质量 seed；")
+    ap.add_argument("--no_download", action="store_true",
+                    help="关闭下载（默认开启：CI 拉取人民网/维基/古登堡真实高质量语料；本地冒烟可加 --no_download）")
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
@@ -195,10 +305,10 @@ def main():
     signal.signal(signal.SIGTERM, _on_term)
 
     torch.manual_seed(42)
-    # 构建/复用语料：默认不下载（CI 稳定优先，只用内置高质量 seed + corpus artifact 复用）；
-    # 本地/手动可开 --allow_download 增强。resume 时若 data/v3_*.bin 已存在则跳过构建。
-    build_corpus_v3.build(args.seq_len, allow_download=args.allow_download)
-    sampler = MixedSampler(args.seq_len)
+    # 构建/复用语料：默认开启下载真实高质量语料（人民网/维基/古登堡）；加 --no_download 则用内置 seed。
+    # resume 时若 data/v3_*.bin 已存在且长度匹配则跳过构建（从 corpus artifact 复用）。
+    build_corpus_v3.build(args.seq_len, allow_download=not args.no_download)
+    sampler = CurriculumSampler(args.seq_len)
 
     model = MoleculeV3(vocab_size=VOCAB)
     n_params = model.num_params() / 1e6
@@ -243,10 +353,10 @@ def main():
                   % (args.max_minutes, step))
             break
         gstep = step0 + (step - step0)  # 全局步数（warmup 基于它）
-        lr = lr_at(gstep, args.lr)
+        lr = lr_at(gstep, clk["total_minutes"])
         for g in opt.param_groups:
             g["lr"] = lr
-        idx = sampler.batch(args.batch)
+        idx = sampler.batch(args.batch, clk["total_minutes"])
         out = model(idx, idx)
         loss = out["loss"]
         opt.zero_grad()
@@ -255,13 +365,23 @@ def main():
         opt.step()
         last_step = step + 1
         tokens_this_run += args.batch * args.seq_len
+        # Mid-training 难样本池：训练到一定步数后按困惑度筛选最高质量的难样本，
+        # 构建一次并持久化（后续 CI 轮次直接复用），使最后 10% 的 Mid-training
+        # 真正落在"难样本 + 退火"上，而不是退化成均匀采样。
+        if (not os.path.exists(MIDTRAIN_BIN)) and last_step >= MIDTRAIN_POOL_AT_STEP:
+            print("[midtrain] 训练 %d 步后构建困惑度难样本池…" % last_step, flush=True)
+            if build_midtrain_pool(model, args.seq_len):
+                sampler.reload_midtrain(MIDTRAIN_BIN)
         run_lm = out["loss_lm"].item() if run_lm is None else 0.95 * run_lm + 0.05 * out["loss_lm"].item()
         run_mtp = out["loss_mtp"].item() if run_mtp is None else 0.95 * run_mtp + 0.05 * out["loss_mtp"].item()
         if (step + 1) % 10 == 0 or step == step0:
             el = (time.time() - t_start) / 60
             ppl = math.exp(min(run_lm, 20))
-            print("[step %d] loss=%.3f (lm=%.3f mtp=%.3f) ppl≈%.2f lr=%.2e %.1f min"
-                  % (step + 1, loss.item(), run_lm, run_mtp, ppl, lr, el))
+            # 吞吐实测（tokens/s）：用于推算 10 天窗口能吃到多少 token，
+            # 也就是"训练量是否够"——这是 v3.0 质量上限的硬约束，必须可观测。
+            tps = tokens_this_run / max(el * 60.0, 1e-6)
+            print("[step %d] loss=%.3f (lm=%.3f mtp=%.3f) ppl≈%.2f lr=%.2e %.1f min %.1f tok/s"
+                  % (step + 1, loss.item(), run_lm, run_mtp, ppl, lr, el, tps))
         # 周期存档（抗取消）：落本地帧 + 增量记账 + 推滚动发布（非阻塞），最坏只丢 save_every 分钟
         if (time.time() - last_save) / 60 >= args.save_every:
             save_checkpoint(model, opt, last_step, loss, run_lm, tokens_this_run, clk)

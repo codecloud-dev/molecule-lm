@@ -211,18 +211,18 @@ class BinaryAttention(nn.Module):
         att = (q @ K.transpose(-1, -2)) / math.sqrt(self.hd)    # [B,n_q,1,L]
         att = F.softmax(att, dim=-1) @ V                        # [B,n_q,1,hd]
         att_out = self.out_proj(att.transpose(1, 2).reshape(B, 1, -1))  # [B,1,d_model]
-        # 复刻 forward 的 DeepNorm 残差 + SwiGLU FFN（与 MoleculeV3.step 调用约定一致：返回完整 block 输出）
-        x = x_t + ALPHA_DEEPNORM * att_out
-        xn = self.norm_ffn(x)
+        # 返回【仅变换量】；DeepNorm 残差由 MoleculeV3.step 统一施加（与 forward 一致，避免双重放大）。
+        xn = self.norm_ffn(x_t)
         ffn = self.w_down(F.silu(self.w_gate(xn)) * self.w_up(xn))
-        x = x + ALPHA_DEEPNORM * ffn
-        return x, st
+        return att_out + ffn, st
 
     def forward(self, x):
-        x = x + ALPHA_DEEPNORM * self._attn(self.norm_attn(x))
-        x = x + ALPHA_DEEPNORM * self.w_down(
-            F.silu(self.w_gate(self.norm_ffn(x))) * self.w_up(self.norm_ffn(x)))
-        return x
+        # 返回【仅变换量】；DeepNorm 残差 (x += α·transform) 由 MoleculeV3.forward 统一施加，
+        # 与 MambaSSM 保持一致，避免注意力块被双重 DeepNorm(α + α²) 放大导致激活爆炸/训练发散。
+        att_out = self._attn(self.norm_attn(x))
+        xn = self.norm_ffn(x)
+        ffn = self.w_down(F.silu(self.w_gate(xn)) * self.w_up(xn))
+        return att_out + ffn
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +297,7 @@ class MoleculeV3(nn.Module):
             if kind == "m":
                 x = x + ALPHA_DEEPNORM * self.mamba_blocks[gid].step(x, st["mamba"][p])[0]
             else:
-                x = self.attn_blocks[gid].step(x, st["attn"][p])[0]
+                x = x + ALPHA_DEEPNORM * self.attn_blocks[gid].step(x, st["attn"][p])[0]
         x = self.norm_out(x)
         return F.linear(x, self.lm_head.weight)           # [B,1,vocab]
 
