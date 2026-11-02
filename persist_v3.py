@@ -72,7 +72,8 @@ def main():
 
         # 收集要上传的文件（--clobber 覆盖同名，不堆积）。
         files = []
-        for f in ("checkpoints/v3.pt", "data/v3_clock.json", "data/self_bpe_8192.json"):
+        for f in ("checkpoints/v3.pt", "data/v3_clock.json",
+                  "data/self_bpe_8192.json", "data/v3_corpus_stamp.txt"):
             if os.path.exists(f):
                 files.append(f)
         for f in glob.glob("data/v3_*.bin"):

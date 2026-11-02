@@ -1050,6 +1050,33 @@ def build_bins(tk, seq_len, allow_download, min_seqs_per_domain=400,
     return total_tokens, real_texts_cache, corpus
 
 
+# 语料配方版本戳：治理逻辑 / 配比 / 源配方 任一变化都必须递增，
+# 否则 CI 会复用旧的 v3_*.bin（resume 省时），新治理逻辑根本不生效——
+# 这是最容易踩的坑：代码改了，训练用的还是三个月前的语料。
+CORPUS_RECIPE_VERSION = "2026-11-02.2"
+
+
+def _corpus_stamp_path():
+    return "data/v3_corpus_stamp.txt"
+
+
+def _write_corpus_stamp(seq_len):
+    with open(_corpus_stamp_path(), "w", encoding="utf-8") as f:
+        f.write("%s seq_len=%d\n" % (CORPUS_RECIPE_VERSION, seq_len))
+
+
+def _corpus_stamp_ok(seq_len):
+    p = _corpus_stamp_path()
+    if not os.path.exists(p):
+        return False
+    try:
+        with open(p, encoding="utf-8") as f:
+            txt = f.read().strip()
+    except OSError:
+        return False
+    return txt.startswith(CORPUS_RECIPE_VERSION) and ("seq_len=%d" % seq_len) in txt
+
+
 def _bins_match_seqlen(seq_len):
     """复用前校验：每个域的 bin 行数须为当前 seq_len 的整数倍，否则重建。"""
     for d in DOMAINS:
@@ -1067,13 +1094,17 @@ def _bins_match_seqlen(seq_len):
 
 def build(seq_len, allow_download=True):
     # resume 场景：若 6 个域的 bin 都已存在且长度匹配（从 corpus artifact 复用），直接跳过，省时
-    if _bins_match_seqlen(seq_len):
+    if _bins_match_seqlen(seq_len) and _corpus_stamp_ok(seq_len):
         total = 0
         for d in DOMAINS:
             arr = np.memmap("data/v3_%s.bin" % d, dtype=np.int32, mode="r")
             total += arr.shape[0]
-        print("[build] 复用已有 v3_*.bin（%d seqs，seq_len=%d 匹配），跳过构建" % (total, seq_len))
+        print("[build] 复用已有 v3_*.bin（%d seqs，seq_len=%d，配方版本 %s 匹配），跳过构建"
+              % (total, seq_len, CORPUS_RECIPE_VERSION))
         return total
+    if _bins_match_seqlen(seq_len):
+        print("[build] 语料配方版本变化（当前 %s）→ 强制重建 bin"
+              % CORPUS_RECIPE_VERSION)
     t0 = time.time()
 
     # 第一轮：先用 seed 拿到分词器（保证即使下载全失败也有可用 tokenizer）
@@ -1115,7 +1146,9 @@ def build(seq_len, allow_download=True):
     except Exception as e:
         print("[gov] 报告写入失败（不阻塞）: %s" % str(e)[:120])
 
-    print("[done] 总 token 数 ≈ %d，耗时 %.1fs" % (total, time.time() - t0))
+    _write_corpus_stamp(seq_len)
+    print("[done] 总 token 数 ≈ %d，耗时 %.1fs（配方版本 %s）"
+          % (total, time.time() - t0, CORPUS_RECIPE_VERSION))
     return total
 
 

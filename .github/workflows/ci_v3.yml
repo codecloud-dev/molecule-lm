@@ -103,6 +103,7 @@ jobs:
             gh release download v3-checkpoint -p "v3_clock.json" -D data 2>/dev/null || echo "[resume] 无 v3_clock.json"
             gh release download v3-checkpoint -p "v3_*.bin" -D data 2>/dev/null || echo "[resume] 无语料 bin"
             gh release download v3-checkpoint -p "self_bpe_8192.json" -D data 2>/dev/null || echo "[resume] 无 BPE"
+            gh release download v3-checkpoint -p "v3_corpus_stamp.txt" -D data 2>/dev/null || echo "[resume] 无语料配方戳（将重建）"
           else
             echo "无滚动检查点（首轮），从零开始训练。"
           fi
@@ -168,7 +169,7 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Upload corpus-v3（语料 bin + BPE，供下一轮复用，省构建）
+      - name: Upload corpus-v3（语料 bin + BPE + 配方版本戳，供下一轮复用，省构建）
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -176,6 +177,7 @@ jobs:
           path: |
             data/v3_*.bin
             data/self_bpe_8192.json
+            data/v3_corpus_stamp.txt
           retention-days: 30
           if-no-files-found: warn
 
