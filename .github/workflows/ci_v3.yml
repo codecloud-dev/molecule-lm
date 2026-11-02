@@ -1,11 +1,12 @@
 name: molecule v3 基础模型 · 续训 / 发版（CPU）
 
-# v3.0 基础模型 CI：训练 → 导出 GGUF → 【10 天发版闸门】→ 自续训。
+# v3.0 基础模型 CI：训练 → 导出 GGUF → 【20 天发版闸门】→ 自续训。
 #
 # 纪律（设计文档 §10 / §12.1）：v3.0 只夯骨干，什么高级功能都不接；目标 PPL<10，能生成通顺中文。
-# 续训链：每轮从最近完成的 run 的 artifact 续训（resume-v3 检查点 + corpus-v3 语料 + assets-v3 时钟），
-#   导出 GGUF 产物；累计训练时长（data/v3_clock.json）达到 10 天（240h）后才创建 GitHub Release v3.0
-#   （封顶，绝不 3.1），之后停止自动续训；未到 10 天则每轮只导出产物 + 自续训累积。
+# 续训链：每轮从滚动发布 v3-checkpoint 续训（checkpoint + 时钟 + 语料 + 监测日志），
+#   导出 GGUF 产物；累计训练时长（data/v3_clock.json）达到 20 天（480h）后才创建 GitHub Release v3.0
+#   （封顶，绝不 3.1），之后停止自动续训；未到 20 天则每轮只导出产物 + 自续训累积。
+#   硬上限 30 天（720h）：即便质量门未过也强制发版（标注未达标），确保链路必然终止、必有交付。
 #
 # 鲁棒性设计（应对 CI 平台在训练中取消 run，cancel_actor=null 非人为）：
 #   - 训练步骤 continue-on-error，软超时不阻断后续；单轮压短（默认 75min）。
@@ -39,7 +40,7 @@ on:
       max_minutes:
         description: "单轮训练软时限（分钟），务必 < 平台回收边界与步骤硬限"
         required: false
-        default: "75"
+        default: "200"
       save_every:
         description: "周期存档间隔（分钟）；默认 10=每 10 分钟落一帧并推滚动发布，抗 CI 取消最坏只丢 10 分钟"
         required: false
@@ -62,9 +63,10 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    # 单轮硬限预算：安装 ~5m + [语料重建 ~20m（仅配方版本变化后的第一轮）]
-    # + 训练 100m（内层软超时）+ 评测/导出 ~20m + 余量 ≈ 150m
-    timeout-minutes: 165
+    # 单轮硬限预算：安装 ~20m + 自测 ~20m + 语料复用 ~10m + 训练 ~280m（内层软超时）
+    # + 末尾存档/导出/发版闸门 ~35m ≈ 355m（GitHub 单机 job 上限 360m，留 5m 余量）。
+    # 更长单轮 = 更少 run 数 = 续训链更稳、抗取消更稳。
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -142,12 +144,12 @@ jobs:
           echo "--- checkpoints ---"; ls -la checkpoints 2>/dev/null | head || true
           echo "--- data ---"; ls -la data 2>/dev/null | head || true
 
-      - name: Train v3 基础模型（CPU，时间驱动停止，周期存档 + 抗取消持久化 + 续训触发）
-        # 120m > 内层 timeout 100m：让【内层软超时】先触发，走优雅退出路径（SIGTERM handler
-        # → 存最后一帧 → 同步推滚动发布）。若外层先砍（95m），平台会给 SIGTERM，
-        # 训练进程能优雅退出，但末尾步骤可能被跳过——虽然持久化已同步化能保住 checkpoint，
+      - name: Train v3 基础模型（CPU，时间驱动停止，周期存档 + 抗取消持久化 + 续训触发 + 全程监测/提问）
+        # 300m > 内层 timeout 280m：让【内层软超时】先触发，走优雅退出路径（SIGTERM handler
+        # → 存最后一帧 → 同步推滚动发布）。若外层先砍（~320m），平台会给 SIGTERM，
+        # 训练进程能优雅退出，但末尾步骤可能被跳过——持久化已同步化能保住 checkpoint，
         # 仍应让内层先收口，把主动权握在自己手里。
-        timeout-minutes: 120
+        timeout-minutes: 300
         continue-on-error: true
         env:
           OMP_NUM_THREADS: "4"
@@ -159,22 +161,25 @@ jobs:
           # 续训触发（抗取消核心）：训练进程【正常结束】或【优雅 SIGTERM 退出】都会跑本 trap。
           #   - 平台取消 run 时 if:always 步骤会被跳过，所以不能只依赖末尾的 Release gate 来续训；
           #     把续训触发放进 EXIT trap，即便被取消（收到 SIGTERM）也能续上下一轮。
-          #   - 守卫：确有训练进度(clock>0) 且 未到 10 天 且 未 STOP_V3 且 当前无其它活跃 v3 run(去重防分叉)。
+          #   - 守卫：确有训练进度(clock>0) 且 未 STOP_V3 且 未熔断 且 当前无其它活跃 v3 run(去重防分叉)
+          #     且 未越 30 天硬上限；到 20 天但发版未成（PPL 未达标/本轮 export 被截断）则继续续训，
+          #     直到 Release gate 真正发版或撞 30 天硬上限强制发版。
           fire_continue() {
             HOURS=0
             if [ -f data/v3_clock.json ]; then
               HOURS=$(python -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
             fi
-            if [ "${HOURS%.*}" -ge 240 ] 2>/dev/null; then
-              # 到量了，但【质量门】可能拦住发版（PPL 未达 <10）→ 那种情况必须继续训，
-              # 否则链条会断在这里（trap 不续训 + Release gate 不发版 = 死锁）。
-              # 所以只有"到量 且 质量达标"才停训；质量不达标 → 继续训到达标。
-              PPL_NOW=$(python -c "import math,torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);p=float(s.get('ppl') or 0.0);print('%.4f'%p if (math.isfinite(p) and p>0) else '999')" 2>/dev/null || echo 999)
-              PPL_FINE=$(python -c "print(1 if float('$PPL_NOW')<10.0 else 0)")
-              if [ "$PPL_FINE" = "1" ]; then
-                echo "[continue] 已达 10 天且 PPL=$PPL_NOW 达标，不续训（交由 Release gate 发版）。"; return 0
-              fi
-              echo "[continue] 已达 10 天但 PPL=$PPL_NOW 未达 <10，质量门会拦住发版 → 继续续训直到质量达标。"
+            # 已发版 v3.0（或撞 30 天硬上限由 gate 强制发版）→ 不再续训
+            if gh release view v3.0 >/dev/null 2>&1; then
+              echo "[continue] v3.0 已发布，停止续训。"; return 0
+            fi
+            if [ "${HOURS%.*}" -ge 720 ] 2>/dev/null; then
+              echo "[continue] 已撞 30 天硬上限，交由 Release gate 强制发版，不续训。"; return 0
+            fi
+            if [ "${HOURS%.*}" -ge 480 ] 2>/dev/null; then
+              # 到量但未发版（PPL 未达 <10，或本轮 export 被截断致 gate 跳过）：继续续训，
+              # 让下一轮把质量/产物补上。质量门在本步骤下方的 Release gate 判定。
+              echo "[continue] 已达 20 天但 v3.0 尚未发布，继续续训直到发版（质量门在 Release gate 判定）。"
             fi
             if [ -n "${STOP_V3:-}" ] || [ -f STOP_V3 ]; then
               echo "[continue] STOP_V3 置位，不续训。"; return 0
@@ -196,17 +201,18 @@ jobs:
             gh api repos/$GITHUB_REPOSITORY/dispatches -f event_type=continue-v3
           }
           trap 'fire_continue' EXIT
-          # 100m：给【语料重建】留出 ~20m（配方版本变化后的第一轮会重建），
-          # 之后版本戳命中 → 秒级复用，训练时间回到 80m。
-          timeout 100m python -u train_v3.py \
+          # 280m 内层软超时：留 ~20m 给语料复用/重建，之后每轮稳定训练 ~275m；
+          # 滚动发布周期存档默认 30m（最坏丢 30m），提问默认每 150 步（≈22 分钟）一次。
+          timeout 280m python -u train_v3.py \
             --seq_len "${{ inputs.seq_len || '256' }}" \
             --batch "${{ inputs.batch || '4' }}" \
-            --max_minutes "${{ inputs.max_minutes || '75' }}" \
-            --save_every "${{ inputs.save_every || '10' }}" \
+            --max_minutes "${{ inputs.max_minutes || '200' }}" \
+            --save_every "${{ inputs.save_every || '30' }}" \
+            --probe_every "${{ inputs.probe_every || '150' }}" \
             --resume
           echo "[train] 训练进程退出码 $?"
 
-      - name: Upload resume + corpus + assets artifacts（每轮都留档，链自愈）
+      - name: Upload resume + corpus + assets + 监测 artifacts（每轮都留档，链自愈）
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -215,6 +221,10 @@ jobs:
             checkpoints
             data/v3_clock.json
             data/v3_midtrain.bin
+            data/v3_train_log.jsonl
+            data/v3_eval_probe.jsonl
+            data/v3_dashboard.md
+            data/v3_checks.log
           retention-days: 30
           if-no-files-found: warn
 
@@ -295,7 +305,7 @@ jobs:
           if [ -f data/v3_clock.json ]; then
             HOURS=$(python -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))")
           fi
-          echo "累计训练小时: $HOURS / 240（10 天）"
+          echo "累计训练小时: $HOURS / 480（20 天，硬上限 720=30 天）"
 
           CONTINUE=true
           # 停止开关：仓库变量 STOP_V3 置位，或根存在 STOP_V3 文件 → 不发版（续训已由训练步骤 EXIT trap 负责）
@@ -304,23 +314,25 @@ jobs:
             exit 0
           fi
 
-          REACHED=$(python -c "print(1 if $HOURS>=240 else 0)")
-          if [ "$REACHED" -eq 1 ]; then
-            # 【质量门】时钟到了 != 模型能发。训练崩了（PPL 爆炸 / NaN）也会攒满 10 天，
-            # 那时发出来的是废模型。设计目标 PPL<10，必须同时达标才发版。
+          REACHED=$(python -c "print(1 if $HOURS>=480 else 0)")
+          FORCE=$(python -c "print(1 if $HOURS>=720 else 0)")
+          if [ "$REACHED" -eq 1 ] || [ "$FORCE" -eq 1 ]; then
+            # 【质量门】时钟到了 != 模型能发。训练崩了（PPL 爆炸 / NaN）也会攒满 20 天，
+            # 那时发出来的是废模型。设计目标 PPL<10，达标才发版。
             # 拿不到 PPL（checkpoint 缺失/损坏）按【不达标】处理 —— 宁可不发，不发废模型。
             PPL=$(python -c "import math,torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);p=float(s.get('ppl') or 0.0);print('%.4f'%p if (math.isfinite(p) and p>0) else '999')" 2>/dev/null || echo 999)
             PPL_OK=$(python -c "print(1 if float('$PPL')<10.0 else 0)")
             echo "发版质量门：PPL=$PPL（目标 <10）"
-            if [ "$PPL_OK" != "1" ]; then
-              # 宁缺毋滥：到量但质量不达标 → 不发版。
-              # 直接退出本步骤（跳过发版主体），续训由训练步骤的 EXIT trap 负责
-              # （trap 在【进程退出时】必跑，比依赖末尾步骤可靠）。
-              echo "已达 10 天但 PPL=$PPL 未达 <10，不发版 v3.0（宁缺毋滥），继续续训直到质量达标。"
+            if [ "$PPL_OK" != "1" ] && [ "$FORCE" != "1" ]; then
+              # 到 20 天但质量未达标，且未撞 30 天硬上限 → 不发版，交由 EXIT trap 继续续训。
+              echo "已达 20 天但 PPL=$PPL 未达 <10，不发版 v3.0（宁缺毋滥），继续续训直到质量达标。"
               echo "[release] 质量门未过，跳过发版。"
               exit 0
             fi
-            echo "已达 10 天且 PPL=$PPL 达标，发版 v3.0 并停止自动续训。"
+            if [ "$PPL_OK" != "1" ] && [ "$FORCE" = "1" ]; then
+              echo "已撞 30 天硬上限且 PPL=$PPL 仍未 <10，强制发版（标注质量未达标）。"
+            fi
+            echo "发版 v3.0（PPL=$PPL）并停止自动续训。"
             TAG="v3.0"
             for f in molecule-v3-source.gguf molecule-v3.gguf; do
               if [ ! -f "$f" ]; then echo "缺少 $f，跳过发版"; CONTINUE=false; exit 0; fi
@@ -348,6 +360,10 @@ jobs:
               if [ -f data/v3_clock.json ]; then
                 C=$(python -c "import json;c=json.load(open('data/v3_clock.json'));print('%d 轮 / %.0f 小时 / %.2fB token'%(c['runs'],c['total_minutes']/60.0,c['total_tokens']/1e9))")
                 echo "训练累计：$C"
+              fi
+              if [ "$PPL_OK" != "1" ]; then
+                echo
+                echo "⚠️ 质量未达标提示：发版时 PPL=$PPL 未达 <10 目标（30 天硬上限强制发版，v3.0 已可加载使用，后续 v3.1+ 再精炼）。"
               fi
               if [ -f molecule_rsi_status.md ]; then
                 echo; echo "## 训练调度状态（MetaRSI）"; cat molecule_rsi_status.md
@@ -377,5 +393,5 @@ jobs:
             fi
             CONTINUE=false
           else
-            echo "未到 10 天，本轮 GGUF 已导出为产物；续训由训练步骤 EXIT trap 自动触发。"
+            echo "未到 20 天，本轮 GGUF 已导出为产物；续训由训练步骤 EXIT trap 自动触发。"
           fi

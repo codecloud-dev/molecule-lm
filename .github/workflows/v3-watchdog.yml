@@ -67,9 +67,12 @@ jobs:
             BASE=$(python -c "import json;print(round(json.load(open('/tmp/v3wd/v3_state.json')).get('baseline_minutes',0.0),2))" 2>/dev/null || echo 0)
             FAILS=$(python -c "import json;print(int(json.load(open('/tmp/v3wd/v3_state.json')).get('consecutive_failures',0)))" 2>/dev/null || echo 0)
           fi
-          echo "累计训练小时: $HOURS / 240（10 天）"
-          if [ "${HOURS%.*}" -ge 240 ] 2>/dev/null; then
-            echo "已达 10 天，看门狗不续训（应由 Release gate 发版）。"; exit 0
+          echo "累计训练小时: $HOURS / 480（20 天，硬上限 720=30 天）"
+          if [ "${HOURS%.*}" -ge 720 ] 2>/dev/null; then
+            echo "已撞 30 天硬上限，看门狗不续训（应由 Release gate 强制发版）。"; exit 0
+          fi
+          if [ "${HOURS%.*}" -ge 480 ] 2>/dev/null; then
+            echo "已达 20 天，看门狗不续训（应由 Release gate 发版）。"; exit 0
           fi
 
           # 3) 上轮成功 → 续训已由训练步骤 EXIT trap 处理，看门狗不重复派发
