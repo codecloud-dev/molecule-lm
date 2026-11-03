@@ -92,54 +92,42 @@ jobs:
         run: |
           python tools/test_corpus_govern.py
 
-      - name: Resume from rolling checkpoint（v3-checkpoint 滚动发布，抗取消）
-        timeout-minutes: 10
+      - name: Resume from 上一轮 artifact（resume-v3，抗取消；curl+GITHUB_TOKEN 绕过失效的 gh CLI）
+        timeout-minutes: 12
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          # 单一持久源：滚动发布 v3-checkpoint（checkpoint + 时钟 + 语料），抗取消；
-          # 平台取消 run 时 if:always artifact 会丢失，但滚动发布是仓库级持久存储，不受影响。
-          if gh release view v3-checkpoint >/dev/null 2>&1; then
-            echo "从滚动发布 v3-checkpoint 续训..."
-            gh release download v3-checkpoint -p "v3.pt" -D checkpoints 2>/dev/null || echo "[resume] 无 v3.pt"
-            gh release download v3-checkpoint -p "v3_clock.json" -D data 2>/dev/null || echo "[resume] 无 v3_clock.json"
-            gh release download v3-checkpoint -p "v3_*.bin" -D data 2>/dev/null || echo "[resume] 无语料 bin"
-            gh release download v3-checkpoint -p "self_bpe_8192.json" -D data 2>/dev/null || echo "[resume] 无 BPE"
-            gh release download v3-checkpoint -p "v3_corpus_stamp.txt" -D data 2>/dev/null || echo "[resume] 无语料配方戳（将重建）"
-          else
-            echo "无滚动检查点（首轮），从零开始训练。"
-            # 【兜底】滚动发布建不起来时，从【上一轮成功 run 的 artifact】恢复。
-            # 背景：曾因 persist_v3.py 认错 token 变量名（查 GITHUB_TOKEN，
-            # 而 CI 注入的是 GH_TOKEN）导致滚动发布从未建立，每轮都从零训练，
-            # 10 天时钟永远攒不够。artifact 是第二持久源，能兜住这类"单点失效"。
-            # 只取最近一个成功 run 的 resume-v3 / corpus-v3，取不到就真从零开始。
-            PREV=$(gh run list --workflow "molecule v3 基础模型 · 续训 / 发版（CPU）" \
-                     --status completed --conclusion success --limit 1 \
-                     --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
-            if [ -n "${PREV}" ]; then
-              echo "[resume] 兜底：尝试从上一轮成功 run #${PREV} 的 artifact 恢复..."
-              gh run download "$PREV" -n resume-v3 -D /tmp/prev_resume 2>/dev/null \
-                && echo "[resume] artifact 下载成功" || echo "[resume] artifact 下载失败"
-              if [ -f /tmp/prev_resume/checkpoints/v3.pt ]; then
-                mkdir -p checkpoints && cp /tmp/prev_resume/checkpoints/v3.pt checkpoints/v3.pt
-                echo "[resume] 已恢复 checkpoint"
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json")
+          mkdir -p checkpoints data
+          # 主路径：用 curl+GITHUB_TOKEN 直接打 API 拉【上一轮成功 run 的 resume-v3 产物】。
+          # 不依赖 gh CLI（此前在 CI 中失效，导致 release 下载/上传全失败、每轮从头随机初始化、
+          # 20 天时钟永远不累加）。resume-v3 由 actions/upload-artifact 上传（走 Action，稳定可用）。
+          PREV=$(curl -s "${AUTH[@]}" "$API/actions/runs?status=completed&conclusion=success&per_page=15" \
+                 | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((str(r['id']) for r in d.get('workflow_runs',[]) if r['id']!=int('${{ github.run_id }}') and 'ci_v3' in (r.get('path') or '')),''))" 2>/dev/null || true)
+          echo "[resume] 上一轮成功 run = ${PREV:-无}"
+          if [ -n "${PREV}" ]; then
+            ART_ID=$(curl -s "${AUTH[@]}" "$API/actions/runs/${PREV}/artifacts" \
+                     | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((str(a['id']) for a in d.get('artifacts',[]) if a['name']=='resume-v3'),''))" 2>/dev/null || true)
+            if [ -n "${ART_ID}" ]; then
+              curl -sL "${AUTH[@]}" "$API/actions/artifacts/${ART_ID}/zip" -o /tmp/resume_prev.zip
+              if [ -s /tmp/resume_prev.zip ]; then
+                unzip -o /tmp/resume_prev.zip -d . >/dev/null 2>&1 && echo "[resume] 已从上一轮 artifact 恢复 checkpoint+时钟+语料"
               fi
-              if [ -f /tmp/prev_resume/data/v3_clock.json ]; then
-                mkdir -p data && cp /tmp/prev_resume/data/v3_clock.json data/v3_clock.json
-                echo "[resume] 已恢复训练时钟"
-              fi
-              # 语料 bin：只在上轮有配方戳匹配时才复用，否则让训练脚本重建
-              if ls /tmp/prev_resume/data/v3_*.bin >/dev/null 2>&1; then
-                mkdir -p data && cp /tmp/prev_resume/data/v3_*.bin data/ 2>/dev/null || true
-                cp /tmp/prev_resume/data/v3_corpus_stamp.txt data/ 2>/dev/null || true
-                cp /tmp/prev_resume/data/self_bpe_8192.json data/ 2>/dev/null || true
-                echo "[resume] 已尝试恢复语料（配方戳不匹配则会自动重建）"
-              fi
-            else
-              echo "[resume] 无上一轮成功 run，真从零开始。"
             fi
+          fi
+          # 兜底：artifact 恢复失败再试滚动发布 v3-checkpoint（best-effort，gh 失效时大概率也失败）
+          if [ ! -f checkpoints/v3.pt ] && gh release view v3-checkpoint >/dev/null 2>&1; then
+            gh release download v3-checkpoint -p "v3.pt" -D checkpoints 2>/dev/null || true
+            gh release download v3-checkpoint -p "v3_clock.json" -D data 2>/dev/null || true
+          fi
+          # 验证续训起点（确认确实续上了，而不是又从头随机初始化）
+          if [ -f checkpoints/v3.pt ]; then
+            python3 -c "import torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);c=s.get('clock') or {};print('[resume] 续训起点 step=%s 累计训练分钟=%.1f (%.2f 小时)'%(s.get('step'),c.get('total_minutes',0),c.get('total_minutes',0)/60.0))" 2>/dev/null || echo "[resume] 检查点存在但读取失败"
+          else
+            echo "[resume] 无检查点，将从零开始训练（首轮）"
           fi
           echo "--- checkpoints ---"; ls -la checkpoints 2>/dev/null | head || true
           echo "--- data ---"; ls -la data 2>/dev/null | head || true
@@ -225,6 +213,7 @@ jobs:
             data/v3_eval_probe.jsonl
             data/v3_dashboard.md
             data/v3_checks.log
+            data/v3_persist.log
           retention-days: 30
           if-no-files-found: warn
 
