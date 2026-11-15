@@ -317,7 +317,9 @@ def _download_release_asset(token, repo, tag, asset_name, dest):
                 url = a["url"]; break
         if not url:
             return False
-        subprocess.run(["curl", "-sL", "--max-time", "90"] + hdr + [url, "-o", dest],
+        # 必须用 octet-stream 下载原始字节；用 json accept 会得到资产元数据 JSON 而非文件内容。
+        dl_hdr = ["-H", "Authorization: Bearer %s" % token, "-H", "Accept: application/octet-stream"]
+        subprocess.run(["curl", "-sL", "--max-time", "90"] + dl_hdr + [url, "-o", dest],
                        timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception:

@@ -101,6 +101,10 @@ jobs:
           set -uo pipefail
           API="https://api.github.com/repos/$GITHUB_REPOSITORY"
           AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json")
+          # 下载 release asset / artifact 原始字节必须用 octet-stream；若用 json accept，
+          # GitHub 返回的是资产元数据 JSON（ {...} ）而非文件本体 —— 曾导致 v3.pt/clock 被元数据污染、
+          # torch.load 报 UnpicklingError、训练一行没跑、clock 无 total_minutes、整条链断掉。
+          DL=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream")
           mkdir -p checkpoints data
           # 主路径：用 curl+GITHUB_TOKEN 直接打 API 拉【上一轮成功 run 的 resume-v3 产物】。
           # 不依赖 gh CLI（此前在 CI 中失效，导致 release 下载/上传全失败、每轮从头随机初始化、
@@ -108,32 +112,45 @@ jobs:
           PREV=$(curl -s "${AUTH[@]}" "$API/actions/runs?status=completed&conclusion=success&per_page=15" \
                  | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((str(r['id']) for r in d.get('workflow_runs',[]) if r['id']!=int('${{ github.run_id }}') and 'ci_v3' in (r.get('path') or '')),''))" 2>/dev/null || true)
           echo "[resume] 上一轮成功 run = ${PREV:-无}"
-          if [ -n "${PREV}" ]; then
-            ART_ID=$(curl -s "${AUTH[@]}" "$API/actions/runs/${PREV}/artifacts" \
-                     | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((str(a['id']) for a in d.get('artifacts',[]) if a['name']=='resume-v3'),''))" 2>/dev/null || true)
-            if [ -n "${ART_ID}" ]; then
-              curl -sL "${AUTH[@]}" "$API/actions/artifacts/${ART_ID}/zip" -o /tmp/resume_prev.zip
-              if [ -s /tmp/resume_prev.zip ]; then
-                unzip -o /tmp/resume_prev.zip -d . >/dev/null 2>&1 && echo "[resume] 已从上一轮 artifact 恢复 checkpoint+时钟+语料"
+          restore_art() {  # $1=artifact name；用 octet-stream 拉 zip（不套 json accept）
+            local aid=$(curl -s "${AUTH[@]}" "$API/actions/runs/${PREV}/artifacts" \
+                        | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((str(a['id']) for a in d.get('artifacts',[]) if a['name']=='$1'),''))" 2>/dev/null || true)
+            if [ -n "$aid" ]; then
+              curl -sL "${DL[@]}" "$API/actions/artifacts/${aid}/zip" -o "/tmp/$1.zip"
+              if [ -s "/tmp/$1.zip" ]; then
+                unzip -o "/tmp/$1.zip" -d . >/dev/null 2>&1 && echo "[resume] 恢复 $1 成功" && return 0
               fi
             fi
+            return 1
+          }
+          if [ -n "${PREV}" ]; then
+            restore_art resume-v3 || echo "[resume] resume-v3 恢复失败"
+            restore_art corpus-v3 || echo "[resume] corpus-v3 恢复失败（语料将重建）"
           fi
-          # 兜底：artifact 恢复失败再试滚动发布 v3-checkpoint（best-effort，curl 绕过失效的 gh CLI）
-          if [ ! -f checkpoints/v3.pt ]; then
-            CKPT_URL=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" \
-                       | python3 -c "import sys,json;d=json.load(sys.stdin);a=next((x for x in d.get('assets',[]) if x['name']=='v3.pt'),None);print(a['url'] if a else '')" 2>/dev/null || true)
-            if [ -n "$CKPT_URL" ]; then
-              curl -sL "${AUTH[@]}" "$CKPT_URL" -o checkpoints/v3.pt && echo "[resume] 滚动发布兜底恢复 v3.pt"
-              CLK_URL=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" \
-                        | python3 -c "import sys,json;d=json.load(sys.stdin);a=next((x for x in d.get('assets',[]) if x['name']=='v3_clock.json'),None);print(a['url'] if a else '')" 2>/dev/null || true)
-              [ -n "$CLK_URL" ] && curl -sL "${AUTH[@]}" "$CLK_URL" -o data/v3_clock.json
-            fi
-          fi
-          # 验证续训起点（确认确实续上了，而不是又从头随机初始化）
-          if [ -f checkpoints/v3.pt ]; then
-            python3 -c "import torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);c=s.get('clock') or {};print('[resume] 续训起点 step=%s 累计训练分钟=%.1f (%.2f 小时)'%(s.get('step'),c.get('total_minutes',0),c.get('total_minutes',0)/60.0))" 2>/dev/null || echo "[resume] 检查点存在但读取失败"
+          # 滚动发布 asset 原始地址（始终可用；octet-stream 拿字节，绝不套 json accept）
+          REL=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" 2>/dev/null || echo '{}')
+          get_asset_url() { echo "$REL" | python3 -c "import sys,json;d=json.load(sys.stdin);a=next((x for x in d.get('assets',[]) if x['name']=='$1'),None);print(a['url'] if a else '')" 2>/dev/null || true; }
+          pull_rolling() {  # $1=asset name  $2=dest
+            local u=$(get_asset_url "$1")
+            [ -n "$u" ] && curl -sL "${DL[@]}" "$u" -o "$2" && return 0
+            return 1
+          }
+          # 校验合法性：坏文件（元数据 JSON / 截断）一律删掉，绝不带病进训练
+          ckpt_ok() { [ -f checkpoints/v3.pt ] && python3 -c "import torch;torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False)" >/dev/null 2>&1; }
+          clock_ok() { [ -f data/v3_clock.json ] && python3 -c "import json;d=json.load(open('data/v3_clock.json'));assert 'total_minutes' in d" >/dev/null 2>&1; }
+          ckpt_ok || { echo "[resume] 从滚动发布拉 v3.pt"; pull_rolling v3.pt checkpoints/v3.pt || true; }
+          clock_ok || { echo "[resume] 从滚动发布拉 v3_clock.json"; pull_rolling v3_clock.json data/v3_clock.json || true; }
+          # 二次校验：滚动发布若也坏了就删，绝不带病进训练
+          ckpt_ok || { echo "[resume] v3.pt 仍非法，删除从零开始"; rm -f checkpoints/v3.pt; }
+          if clock_ok; then
+            echo "[resume] clock 合法: $(python3 -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null) 小时"
           else
-            echo "[resume] 无检查点，将从零开始训练（首轮）"
+            echo "[resume] v3_clock.json 仍非法，删除（训练会重建）"; rm -f data/v3_clock.json
+          fi
+          if ckpt_ok; then
+            python3 -c "import torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);c=s.get('clock') or {};print('[resume] 续训起点 step=%s clock累计分钟=%s'%(s.get('step'),c.get('total_minutes',0)))" 2>/dev/null || true
+          else
+            echo "[resume] 无合法检查点，将从零开始训练（首轮）"
           fi
           echo "--- checkpoints ---"; ls -la checkpoints 2>/dev/null | head || true
           echo "--- data ---"; ls -la data 2>/dev/null | head || true
@@ -306,7 +323,7 @@ jobs:
           release_exists() { local c=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH[@]}" "$API/releases/tags/$1"); [ "$c" = "200" ]; }
           HOURS=0
           if [ -f data/v3_clock.json ]; then
-            HOURS=$(python3 -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))")
+            HOURS=$(python3 -c "import json;d=json.load(open('data/v3_clock.json'));print(round(d.get('total_minutes',0)/60.0,2))" 2>/dev/null || echo 0)
           fi
           echo "累计训练小时: $HOURS / 480（20 天，硬上限 720=30 天）"
 
@@ -361,7 +378,7 @@ jobs:
                 echo "评测通过：$P（同口径 20 题，仅趋势监控）"
               fi
               if [ -f data/v3_clock.json ]; then
-                C=$(python3 -c "import json;c=json.load(open('data/v3_clock.json'));print('%d 轮 / %.0f 小时 / %.2fB token'%(c['runs'],c['total_minutes']/60.0,c['total_tokens']/1e9))")
+                C=$(python3 -c "import json;c=json.load(open('data/v3_clock.json'));print('%d 轮 / %.0f 小时 / %.2fB token'%(c.get('runs',0),c.get('total_minutes',0)/60.0,c.get('total_tokens',0)/1e9))")
                 echo "训练累计：$C"
               fi
               if [ "$PPL_OK" != "1" ]; then

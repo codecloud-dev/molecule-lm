@@ -52,10 +52,10 @@ jobs:
             curl -s "${AUTH[@]}" "$API/actions/runs?per_page=5" \
               | python3 -c "import sys,json;d=json.load(sys.stdin);runs=[r for r in d.get('workflow_runs',[]) if 'ci_v3' in (r.get('path') or '')];print(runs[0]['conclusion'] if runs else '')" 2>/dev/null || echo ""
           }
-          download_asset() {  # $1=asset name; $2=dest path
+          download_asset() {  # $1=asset name; $2=dest path（octet-stream 拿原始字节）
             local url=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" \
               | python3 -c "import sys,json;d=json.load(sys.stdin);a=next((x for x in d.get('assets',[]) if x['name']=='$1'),None);print(a['url'] if a else '')" 2>/dev/null || true)
-            [ -n "$url" ] && curl -sL "${AUTH[@]}" "$url" -o "$2"
+            [ -n "$url" ] && curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" "$url" -o "$2"
           }
           upload_state() {  # $1=file（覆盖同名资产到 v3-checkpoint 滚动发布）
             local rel_id=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
@@ -95,7 +95,7 @@ jobs:
           download_asset v3_clock.json /tmp/v3wd/v3_clock.json
           download_asset v3_state.json /tmp/v3wd/v3_state.json
           if [ -f /tmp/v3wd/v3_clock.json ]; then
-            HOURS=$(python3 -c "import json;print(round(json.load(open('/tmp/v3wd/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
+            HOURS=$(python3 -c "import json;d=json.load(open('/tmp/v3wd/v3_clock.json'));print(round(d.get('total_minutes',0)/60.0,2))" 2>/dev/null || echo 0)
           fi
           if [ -f /tmp/v3wd/v3_state.json ]; then
             BASE=$(python3 -c "import json;print(round(json.load(open('/tmp/v3wd/v3_state.json')).get('baseline_minutes',0.0),2))" 2>/dev/null || echo 0)
