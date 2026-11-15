@@ -118,10 +118,16 @@ jobs:
               fi
             fi
           fi
-          # 兜底：artifact 恢复失败再试滚动发布 v3-checkpoint（best-effort，gh 失效时大概率也失败）
-          if [ ! -f checkpoints/v3.pt ] && gh release view v3-checkpoint >/dev/null 2>&1; then
-            gh release download v3-checkpoint -p "v3.pt" -D checkpoints 2>/dev/null || true
-            gh release download v3-checkpoint -p "v3_clock.json" -D data 2>/dev/null || true
+          # 兜底：artifact 恢复失败再试滚动发布 v3-checkpoint（best-effort，curl 绕过失效的 gh CLI）
+          if [ ! -f checkpoints/v3.pt ]; then
+            CKPT_URL=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" \
+                       | python3 -c "import sys,json;d=json.load(sys.stdin);a=next((x for x in d.get('assets',[]) if x['name']=='v3.pt'),None);print(a['url'] if a else '')" 2>/dev/null || true)
+            if [ -n "$CKPT_URL" ]; then
+              curl -sL "${AUTH[@]}" "$CKPT_URL" -o checkpoints/v3.pt && echo "[resume] 滚动发布兜底恢复 v3.pt"
+              CLK_URL=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" \
+                        | python3 -c "import sys,json;d=json.load(sys.stdin);a=next((x for x in d.get('assets',[]) if x['name']=='v3_clock.json'),None);print(a['url'] if a else '')" 2>/dev/null || true)
+              [ -n "$CLK_URL" ] && curl -sL "${AUTH[@]}" "$CLK_URL" -o data/v3_clock.json
+            fi
           fi
           # 验证续训起点（确认确实续上了，而不是又从头随机初始化）
           if [ -f checkpoints/v3.pt ]; then
@@ -146,6 +152,12 @@ jobs:
           V3_PAUSE: ${{ vars.V3_PAUSE }}
         run: |
           set -uo pipefail
+          export GITHUB_TOKEN="${GITHUB_TOKEN:-$GH_TOKEN}"
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json")
+          release_exists() { local c=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH[@]}" "$API/releases/tags/$1"); [ "$c" = "200" ]; }
+          active_v3_runs() { curl -s "${AUTH[@]}" "$API/actions/runs?status=in_progress&per_page=30" | python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for r in d.get('workflow_runs',[]) if 'ci_v3' in (r.get('path') or '') and r['status'] in ('in_progress','queued') and r['id']!=int('${{ github.run_id }}')))" 2>/dev/null || echo 0; }
+          fire_dispatch() { curl -s -X POST "${AUTH[@]}" "$API/dispatches" -d '{"event_type":"continue-v3"}' -o /dev/null -w "[continue] dispatch HTTP %{http_code}\n"; }
           # 续训触发（抗取消核心）：训练进程【正常结束】或【优雅 SIGTERM 退出】都会跑本 trap。
           #   - 平台取消 run 时 if:always 步骤会被跳过，所以不能只依赖末尾的 Release gate 来续训；
           #     把续训触发放进 EXIT trap，即便被取消（收到 SIGTERM）也能续上下一轮。
@@ -155,10 +167,10 @@ jobs:
           fire_continue() {
             HOURS=0
             if [ -f data/v3_clock.json ]; then
-              HOURS=$(python -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
+              HOURS=$(python3 -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
             fi
             # 已发版 v3.0（或撞 30 天硬上限由 gate 强制发版）→ 不再续训
-            if gh release view v3.0 >/dev/null 2>&1; then
+            if release_exists v3.0; then
               echo "[continue] v3.0 已发布，停止续训。"; return 0
             fi
             if [ "${HOURS%.*}" -ge 720 ] 2>/dev/null; then
@@ -178,15 +190,13 @@ jobs:
             if [ "${HOURS}" = "0" ]; then
               echo "[continue] 本轮无有效训练(clock=0)，不续训，避免空转分叉。"; return 0
             fi
-            # 去重：已有其它 in_progress v3 run 则不发（避免分叉成多链）
-            OTHER=$(gh run list --workflow "molecule v3 基础模型 · 续训 / 发版（CPU）" \
-                      --status in_progress --json databaseId --jq \
-                      '.[] | select(.databaseId != ${{ github.run_id }}) | .databaseId' | wc -l)
+            # 去重：已有其它 in_progress/queued v3 run 则不发（避免分叉成多链）
+            OTHER=$(active_v3_runs)
             if [ "${OTHER:-0}" -gt 0 ]; then
               echo "[continue] 已有其它活跃 v3 run（${OTHER}），跳过续训以免分叉。"; return 0
             fi
             echo "[continue] 自动续训下一轮..."
-            gh api repos/$GITHUB_REPOSITORY/dispatches -f event_type=continue-v3
+            fire_dispatch
           }
           trap 'fire_continue' EXIT
           # 280m 内层软超时：留 ~20m 给语料复用/重建，之后每轮稳定训练 ~275m；
@@ -290,9 +300,13 @@ jobs:
           STOP_V3: ${{ vars.STOP_V3 }}
         run: |
           set -uo pipefail
+          export GITHUB_TOKEN="${GITHUB_TOKEN:-$GH_TOKEN}"
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json")
+          release_exists() { local c=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH[@]}" "$API/releases/tags/$1"); [ "$c" = "200" ]; }
           HOURS=0
           if [ -f data/v3_clock.json ]; then
-            HOURS=$(python -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))")
+            HOURS=$(python3 -c "import json;print(round(json.load(open('data/v3_clock.json'))['total_minutes']/60.0,2))")
           fi
           echo "累计训练小时: $HOURS / 480（20 天，硬上限 720=30 天）"
 
@@ -303,13 +317,13 @@ jobs:
             exit 0
           fi
 
-          REACHED=$(python -c "print(1 if $HOURS>=480 else 0)")
-          FORCE=$(python -c "print(1 if $HOURS>=720 else 0)")
+          REACHED=$(python3 -c "print(1 if $HOURS>=480 else 0)")
+          FORCE=$(python3 -c "print(1 if $HOURS>=720 else 0)")
           if [ "$REACHED" -eq 1 ] || [ "$FORCE" -eq 1 ]; then
             # 【质量门】时钟到了 != 模型能发。训练崩了（PPL 爆炸 / NaN）也会攒满 20 天，
             # 那时发出来的是废模型。设计目标 PPL<10，达标才发版。
             # 拿不到 PPL（checkpoint 缺失/损坏）按【不达标】处理 —— 宁可不发，不发废模型。
-            PPL=$(python -c "import math,torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);p=float(s.get('ppl') or 0.0);print('%.4f'%p if (math.isfinite(p) and p>0) else '999')" 2>/dev/null || echo 999)
+            PPL=$(python3 -c "import math,torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);p=float(s.get('ppl') or 0.0);print('%.4f'%p if (math.isfinite(p) and p>0) else '999')" 2>/dev/null || echo 999)
             PPL_OK=$(python -c "print(1 if float('$PPL')<10.0 else 0)")
             echo "发版质量门：PPL=$PPL（目标 <10）"
             if [ "$PPL_OK" != "1" ] && [ "$FORCE" != "1" ]; then
@@ -343,11 +357,11 @@ jobs:
               echo "- molecule-v3-source.gguf：F32 精确源（MInfer 逐层混合精度量化用）"
               echo
               if [ -f eval_v3_result.json ]; then
-                P=$(python -c "import json;d=json.load(open('eval_v3_result.json'));print('%d/%d'%(sum(1 for r in d if r['ok']),len(d)))")
+                P=$(python3 -c "import json;d=json.load(open('eval_v3_result.json'));print('%d/%d'%(sum(1 for r in d if r['ok']),len(d)))")
                 echo "评测通过：$P（同口径 20 题，仅趋势监控）"
               fi
               if [ -f data/v3_clock.json ]; then
-                C=$(python -c "import json;c=json.load(open('data/v3_clock.json'));print('%d 轮 / %.0f 小时 / %.2fB token'%(c['runs'],c['total_minutes']/60.0,c['total_tokens']/1e9))")
+                C=$(python3 -c "import json;c=json.load(open('data/v3_clock.json'));print('%d 轮 / %.0f 小时 / %.2fB token'%(c['runs'],c['total_minutes']/60.0,c['total_tokens']/1e9))")
                 echo "训练累计：$C"
               fi
               if [ "$PPL_OK" != "1" ]; then
@@ -359,12 +373,20 @@ jobs:
               fi
             } > notes.md
 
-            if gh release view "$TAG" >/dev/null 2>&1; then
-              gh release delete "$TAG" -y || true
-              git push --delete origin "$TAG" >/dev/null 2>&1 || true
+            if release_exists "$TAG"; then
+              rel_id=$(curl -s "${AUTH[@]}" "$API/releases/tags/$TAG" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
+              if [ -n "$rel_id" ] && [ "$rel_id" != "None" ]; then
+                curl -s -X DELETE "${AUTH[@]}" "$API/releases/$rel_id" >/dev/null 2>&1 || true
+                curl -s -X DELETE "${AUTH[@]}" "$API/git/refs/tags/$TAG" >/dev/null 2>&1 || true
+              fi
             fi
-            gh release create "$TAG" --title "molecule v3.0（基础模型）" --notes-file notes.md \
-              molecule-v3.gguf molecule-v3-source.gguf
+            BODY=$(python3 -c "import json;print(json.dumps(open('notes.md').read()))" 2>/dev/null)
+            REL=$(curl -s -X POST "${AUTH[@]}" "$API/releases" -d "{\"tag_name\":\"$TAG\",\"name\":\"molecule v3.0（基础模型）\",\"body\":$BODY,\"prerelease\":false}")
+            UP=$(echo "$REL" | python3 -c "import sys,json;print(json.load(sys.stdin).get('upload_url','').split('{')[0])" 2>/dev/null)
+            for f in molecule-v3-source.gguf molecule-v3.gguf; do
+              [ -f "$f" ] || { echo "缺少 $f，跳过发版"; exit 0; }
+              curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/octet-stream" --data-binary "@$f" "$UP?name=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$f")" -o /dev/null -w "[release] upload $f HTTP %{http_code}\n"
+            done
             echo "release $TAG 完成"
 
             mkdir -p releases benchmarks

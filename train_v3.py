@@ -302,21 +302,44 @@ def persist(mode="full", block=False):
         pass
 
 
+def _download_release_asset(token, repo, tag, asset_name, dest):
+    """用 curl + GITHUB_TOKEN 从滚动发布下载单个资产（绕过失效的 gh CLI）。"""
+    try:
+        import json as _json
+        api = "https://api.github.com/repos/%s/releases/tags/%s" % (repo, tag)
+        hdr = ["-H", "Authorization: Bearer %s" % token, "-H", "Accept: application/vnd.github+json"]
+        r = subprocess.run(["curl", "-s", "--max-time", "60"] + hdr + [api],
+                           capture_output=True, text=True, timeout=60)
+        d = _json.loads(r.stdout)
+        url = ""
+        for a in d.get("assets", []):
+            if a["name"] == asset_name:
+                url = a["url"]; break
+        if not url:
+            return False
+        subprocess.run(["curl", "-sL", "--max-time", "90"] + hdr + [url, "-o", dest],
+                       timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
 def resume_logs():
-    """续训时把上一轮在滚动发布上的累计监测日志拉回本地，继续追加（保证日志跨 run 连续）。"""
+    """续训时把上一轮在滚动发布上的累计监测日志拉回本地，继续追加（保证日志跨 run 连续）。
+    全部走 curl + GITHUB_TOKEN，不再依赖 gh CLI（此前在 CI 中失效）。"""
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
         return
-    env = dict(os.environ)
-    env["GH_TOKEN"] = token
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        return
     for f in (LOG_JSONL, PROBE_JSONL, DASH, CHECKS_LOG):
         try:
             if os.path.exists(f):
                 continue  # 本地已有（如刚下载过）则不覆盖
-            subprocess.run(["gh", "release", "download", "v3-checkpoint", "-p", f, "-D", "data"],
-                           env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            _download_release_asset(token, repo, "v3-checkpoint", f, f)
         except Exception:
             pass
 

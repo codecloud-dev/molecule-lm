@@ -12,6 +12,7 @@ name: molecule v3 看门狗（续训兜底）
 #   ④ 有活跃/排队 run 即跳过（去重，不与正常续训分叉；concurrency 组已保证串行）。
 #
 # 状态存于滚动发布 v3-checkpoint 的 v3_state.json：{baseline_minutes, consecutive_failures}。
+# 全部走 curl + GITHUB_TOKEN，不再依赖 gh CLI（此前在 CI 中失效）。
 
 on:
   schedule:
@@ -36,7 +37,43 @@ jobs:
       - name: 巡检并兜底续训（炸弹安全：仅上轮失败且有进度才续；3 轮无进度熔断）
         run: |
           set -uo pipefail
+          export GITHUB_TOKEN="${GITHUB_TOKEN:-$GH_TOKEN}"
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json")
+
           WF="molecule v3 基础模型 · 续训 / 发版（CPU）"
+
+          # helpers（全 curl，绕过失效的 gh CLI）
+          active_v3_runs() {
+            curl -s "${AUTH[@]}" "$API/actions/runs?status=in_progress&per_page=30" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for r in d.get('workflow_runs',[]) if 'ci_v3' in (r.get('path') or '') and r['status'] in ('in_progress','queued')))" 2>/dev/null || echo 0
+          }
+          last_conclusion() {
+            curl -s "${AUTH[@]}" "$API/actions/runs?per_page=5" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);runs=[r for r in d.get('workflow_runs',[]) if 'ci_v3' in (r.get('path') or '')];print(runs[0]['conclusion'] if runs else '')" 2>/dev/null || echo ""
+          }
+          download_asset() {  # $1=asset name; $2=dest path
+            local url=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);a=next((x for x in d.get('assets',[]) if x['name']=='$1'),None);print(a['url'] if a else '')" 2>/dev/null || true)
+            [ -n "$url" ] && curl -sL "${AUTH[@]}" "$url" -o "$2"
+          }
+          upload_state() {  # $1=file（覆盖同名资产到 v3-checkpoint 滚动发布）
+            local rel_id=$(curl -s "${AUTH[@]}" "$API/releases/tags/v3-checkpoint" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
+            if [ -z "$rel_id" ] || [ "$rel_id" = "None" ]; then
+              local out=$(curl -s -X POST "${AUTH[@]}" "$API/releases" -d '{"tag_name":"v3-checkpoint","name":"v3 滚动检查点（自动，勿手动改）","body":"自动滚动检查点。","prerelease":true}')
+              rel_id=$(echo "$out" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
+            fi
+            local upload_url=$(curl -s "${AUTH[@]}" "$API/releases/$rel_id" | python3 -c "import sys,json;print(json.load(sys.stdin).get('upload_url','').split('{')[0])" 2>/dev/null)
+            # 删同名旧资产
+            curl -s "${AUTH[@]}" "$API/releases/$rel_id" | python3 -c "import sys,json;d=json.load(sys.stdin);[print(a['id']) for a in d.get('assets',[]) if a['name']=='$1']" 2>/dev/null \
+              | while read aid; do curl -s -X DELETE "${AUTH[@]}" "$API/releases/assets/$aid" >/dev/null 2>&1; done
+            curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/octet-stream" --data-binary "@$1" \
+              "$upload_url?name=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1")" \
+              -o /dev/null -w "[watchdog] upload $1 HTTP %{http_code}\n"
+          }
+          fire_dispatch() {
+            curl -s -X POST "${AUTH[@]}" "$API/dispatches" -d '{"event_type":"continue-v3"}' -o /dev/null -w "[watchdog] dispatch HTTP %{http_code}\n"
+          }
 
           # 0) 熔断 / 停止开关：任一置位即停
           if [ -n "${V3_PAUSE:-}" ]; then
@@ -47,8 +84,7 @@ jobs:
           fi
 
           # 1) 有活跃(in_progress 或 queued) run 就跳过（去重；concurrency 组已保证串行）
-          ACTIVE=$(gh run list --workflow "$WF" --limit 5 \
-                    --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
+          ACTIVE=$(active_v3_runs)
           if [ "${ACTIVE:-0}" -gt 0 ]; then
             echo "有 ${ACTIVE} 个活跃/排队 v3 run，看门狗跳过。"; exit 0
           fi
@@ -56,16 +92,14 @@ jobs:
           # 2) 读累计训练小时 + 状态（滚动发布 v3-checkpoint）
           HOURS=0; BASE=0; FAILS=0
           mkdir -p /tmp/v3wd
-          if gh release view v3-checkpoint >/dev/null 2>&1; then
-            gh release download v3-checkpoint -p "v3_clock.json" -D /tmp/v3wd 2>/dev/null || true
-            gh release download v3-checkpoint -p "v3_state.json" -D /tmp/v3wd 2>/dev/null || true
-          fi
+          download_asset v3_clock.json /tmp/v3wd/v3_clock.json
+          download_asset v3_state.json /tmp/v3wd/v3_state.json
           if [ -f /tmp/v3wd/v3_clock.json ]; then
-            HOURS=$(python -c "import json;print(round(json.load(open('/tmp/v3wd/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
+            HOURS=$(python3 -c "import json;print(round(json.load(open('/tmp/v3wd/v3_clock.json'))['total_minutes']/60.0,2))" 2>/dev/null || echo 0)
           fi
           if [ -f /tmp/v3wd/v3_state.json ]; then
-            BASE=$(python -c "import json;print(round(json.load(open('/tmp/v3wd/v3_state.json')).get('baseline_minutes',0.0),2))" 2>/dev/null || echo 0)
-            FAILS=$(python -c "import json;print(int(json.load(open('/tmp/v3wd/v3_state.json')).get('consecutive_failures',0)))" 2>/dev/null || echo 0)
+            BASE=$(python3 -c "import json;print(round(json.load(open('/tmp/v3wd/v3_state.json')).get('baseline_minutes',0.0),2))" 2>/dev/null || echo 0)
+            FAILS=$(python3 -c "import json;print(int(json.load(open('/tmp/v3wd/v3_state.json')).get('consecutive_failures',0)))" 2>/dev/null || echo 0)
           fi
           echo "累计训练小时: $HOURS / 480（20 天，硬上限 720=30 天）"
           if [ "${HOURS%.*}" -ge 720 ] 2>/dev/null; then
@@ -76,26 +110,28 @@ jobs:
           fi
 
           # 3) 上轮成功 → 续训已由训练步骤 EXIT trap 处理，看门狗不重复派发
-          LAST=$(gh run list --workflow "$WF" --limit 1 \
-                  --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
+          LAST=$(last_conclusion)
           if [ "$LAST" = "success" ]; then
             echo "上轮成功，续训已由训练 EXIT trap 处理，看门狗跳过。"; exit 0
           fi
 
           # 4) 进度判定：是否比基线有新训练；无进度（典型 setup 崩、啥没训）不续训，防空转炸弹
-          PROGRESSED=$(python -c "print(1 if $HOURS > $BASE + 0.01 else 0)" 2>/dev/null || echo 0)
+          PROGRESSED=$(python3 -c "print(1 if $HOURS > $BASE + 0.01 else 0)" 2>/dev/null || echo 0)
           if [ "$PROGRESSED" = "1" ]; then
-            python -c "import json;json.dump({'baseline_minutes':$HOURS,'consecutive_failures':0},open('/tmp/v3wd/v3_state.json','w'))"
-            gh release upload v3-checkpoint --clobber /tmp/v3wd/v3_state.json 2>/dev/null || true
+            python3 -c "import json;json.dump({'baseline_minutes':$HOURS,'consecutive_failures':0},open('/tmp/v3wd/v3_state.json','w'))"
+            upload_state /tmp/v3wd/v3_state.json
             echo "看门狗：上轮有训练进度，补发 continue-v3。"
-            gh api repos/$GITHUB_REPOSITORY/dispatches -f event_type=continue-v3
+            fire_dispatch
           else
             FAILS=$((FAILS+1))
-            python -c "import json;json.dump({'baseline_minutes':$BASE,'consecutive_failures':$FAILS},open('/tmp/v3wd/v3_state.json','w'))"
-            gh release upload v3-checkpoint --clobber /tmp/v3wd/v3_state.json 2>/dev/null || true
+            python3 -c "import json;json.dump({'baseline_minutes':$BASE,'consecutive_failures':$FAILS},open('/tmp/v3wd/v3_state.json','w'))"
+            upload_state /tmp/v3wd/v3_state.json
             if [ "${FAILS:-0}" -ge 3 ]; then
               echo "连续 ${FAILS} 轮无训练进度（疑似 setup/环境问题），看门狗自动熔断：设 V3_PAUSE。请人工排查后再删 V3_PAUSE 恢复。"
-              gh variable set V3_PAUSE --body "1" || true
+              RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${AUTH[@]}" "$API/actions/variables" -d '{"name":"V3_PAUSE","value":"1"}')
+              if [ "$RESP" = "409" ] || [ "$RESP" = "422" ]; then
+                curl -s -X PATCH "${AUTH[@]}" "$API/actions/variables/V3_PAUSE" -d '{"name":"V3_PAUSE","value":"1"}' -o /dev/null -w "[watchdog] patch V3_PAUSE %{http_code}\n"
+              fi
             else
               echo "上轮无训练进度（${FAILS}/3），看门狗暂不续训，避免空转炸弹。"
             fi
