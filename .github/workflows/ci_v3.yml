@@ -296,6 +296,21 @@ jobs:
               print('eval status n/a:', e)
           PY
 
+      - name: Upload 评测报告（24 指标 + 雷达图/柱状图/PPL 折线；非评测轮无文件则跳过）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-v3
+          path: |
+            eval_v3_result.json
+            eval_v3_metrics.json
+            eval_v3_metrics.md
+            eval_v3_radar.png
+            eval_v3_bars.png
+            eval_v3_history.png
+          retention-days: 30
+          if-no-files-found: ignore
+
       - name: 记录 MetaRSI 调度（离线，零用户侧影响）
         timeout-minutes: 5
         continue-on-error: true
@@ -407,6 +422,9 @@ jobs:
               if [ -f eval_v3_result.json ]; then
                 P=$(python3 -c "import json;d=json.load(open('eval_v3_result.json'));print('%d/%d'%(sum(1 for r in d if r['ok']),len(d)))")
                 echo "评测通过：$P（同口径 20 题，仅趋势监控）"
+              fi
+              if [ -f eval_v3_metrics.md ]; then
+                echo; cat eval_v3_metrics.md
               fi
               if [ -f data/v3_clock.json ]; then
                 C=$(python3 -c "import json;c=json.load(open('data/v3_clock.json'));print('%d 轮 / %.0f 小时 / %.2fB token'%(c.get('runs',0),c.get('total_minutes',0)/60.0,c.get('total_tokens',0)/1e9))")
