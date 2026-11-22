@@ -69,28 +69,42 @@ jobs:
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 自测护栏只在相关代码变化时跑一次，后续轮次直接复用“已通过”标记，省 ~20min/轮。
+      - name: Restore 自测通过标记（代码未变则跳过重复自测）
+        id: selftest_gate
+        uses: actions/cache@v4
+        with:
+          path: .ci_selftest_ok
+          key: selftest-v1-${{ hashFiles('tests/test_offline.py','tools/test_corpus_govern.py','build_corpus_v3.py','corpus_govern.py','sources_v3.py','modelscope_corpus.py','seed_corpus_v3.py','tokenizer_bpe.py','model_v3.py','train_v3.py','config.py') }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements_v3.txt
 
-      - name: Install dependencies
+      - name: Install dependencies（pip wheel 走缓存，省去每轮从 PyPI 重新下载）
         timeout-minutes: 20
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements_v3.txt
+          pip install --disable-pip-version-check -r requirements_v3.txt
 
       - name: Offline self-test（回归护栏：增量 step 与全量 forward 一致等）
+        if: steps.selftest_gate.outputs.cache-hit != 'true'
         timeout-minutes: 10
         continue-on-error: true
         run: |
           python tests/test_offline.py
 
       - name: 语料治理自测（跨源去重 / 文体上限 / 域内均衡 / 稀释可达）
+        if: steps.selftest_gate.outputs.cache-hit != 'true'
         timeout-minutes: 10
         continue-on-error: false
         run: |
           python tools/test_corpus_govern.py
+          echo ok > .ci_selftest_ok
 
       - name: Resume from 上一轮 artifact（resume-v3，抗取消；curl+GITHUB_TOKEN 绕过失效的 gh CLI）
         timeout-minutes: 12
@@ -260,10 +274,17 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: 模型冒烟评测（趋势监控，异常不阻塞）
+      - name: 模型冒烟评测（趋势监控，异常不阻塞；每 3 轮 + 发版轮跑，省时）
         timeout-minutes: 20
         continue-on-error: true
         run: |
+          RUNS=$(python3 -c "import json;print(int(json.load(open('data/v3_clock.json')).get('runs',0)))" 2>/dev/null || echo 0)
+          HOURS=$(python3 -c "import json;print(json.load(open('data/v3_clock.json')).get('total_minutes',0)/60.0)" 2>/dev/null || echo 0)
+          NEED=$(python3 -c "print(1 if ($RUNS % 3 == 0) or $HOURS >= 460 else 0)" 2>/dev/null || echo 1)
+          if [ "$NEED" != "1" ]; then
+            echo "[eval] 第 $RUNS 轮非评测轮（每 3 轮一次；发版轮必评），跳过以把时间留给训练。"; exit 0
+          fi
+          echo "[eval] 第 $RUNS 轮执行评测（累计 $HOURS 小时）"
           timeout 18m python eval_v3.py --out eval_v3_result.json || echo "[eval] 异常跳过"
           python - <<'PY' || true
           import json
@@ -292,10 +313,16 @@ jobs:
           subprocess.run(['python', 'metarsi.py', 'suggest'], check=False)
           PY
 
-      - name: Export GGUF（f32 精确源 + f16 半精度发布版）
+      - name: Export GGUF（f32 精确源 + f16 半精度发布版；仅临近发版执行，省每轮 ~18min）
         timeout-minutes: 20
         continue-on-error: true
         run: |
+          HOURS=$(python3 -c "import json;print(json.load(open('data/v3_clock.json')).get('total_minutes',0)/60.0)" 2>/dev/null || echo 0)
+          NEED=$(python3 -c "print(1 if $HOURS >= 460 else 0)" 2>/dev/null || echo 1)
+          if [ "$NEED" != "1" ]; then
+            echo "[export] 累计 $HOURS h < 460 h，未临近发版，跳过导出（发版轮必导出，release gate 会校验 GGUF 存在）。"; exit 0
+          fi
+          echo "[export] 累计 $HOURS h，临近发版，执行导出。"
           timeout 18m python export_gguf_v3.py --ckpt checkpoints/v3.pt \
             --out molecule-v3-source.gguf --quant f32 || echo "[export] f32 失败"
           timeout 18m python export_gguf_v3.py --ckpt checkpoints/v3.pt \
