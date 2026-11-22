@@ -71,11 +71,20 @@ def generate(model, tk, prompt, max_new=180, temperature=0.3, top_p=0.9, seed=0)
         else:
             lp = (logits / temperature).softmax(-1)
             sp, si = torch.sort(lp, descending=True)
+            # 修复：模型极度自信时（最高概率已 > top_p），cut 会算成 0，
+            # 导致全部 token 被 mask → 概率和=0 → multinomial 抛
+            # "probability tensor contains inf/nan"。强制至少保留 top-1。
             cut = sp[sp.cumsum(0) <= top_p].shape[0]
+            cut = max(cut, 1)
             m = torch.ones_like(lp, dtype=torch.bool)
             m[si[:cut]] = False
-            lp = lp.masked_fill(m, 0.0) / lp.masked_fill(m, 0.0).sum()
-            nxt = int(torch.multinomial(lp, 1))
+            masked = lp.masked_fill(m, 0.0)
+            total = masked.sum()
+            # 兜底：万一数值异常导致 total<=0 或非有限，退化为 argmax，绝不让采样崩。
+            if not torch.isfinite(total) or total <= 0:
+                nxt = int(si[0])  # si[0] 即概率最高 token
+            else:
+                nxt = int(torch.multinomial(masked / total, 1))
         if nxt == tk._special_ids["eos"]:
             break
         out_ids.append(nxt)
