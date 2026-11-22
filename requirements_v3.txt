@@ -2,3 +2,5 @@
 torch>=2.1
 numpy>=1.24
 gguf>=0.9.0
+# 评测画图（雷达图/柱状图/PPL折线）；走 pip 缓存，不增常驻依赖，仅 eval 步骤用
+matplotlib>=3.7
