@@ -236,7 +236,7 @@ def make_plots(metrics, dim_stat, out_dir, zh):
         ax.set_ylim(0, 100)
         ax.set_yticks([20, 40, 60, 80, 100])
         title = "维度准确率（%%）· 总体 %.0f%%" % metrics["overall_acc"] if zh \
-            else "Dimension Accuracy (%) · Overall %.0f%%" % metrics["overall_acc"]
+            else "Dimension Accuracy (%%) · Overall %.0f%%" % metrics["overall_acc"]
         ax.set_title(title, fontsize=13, pad=18)
         fig.tight_layout()
         p = os.path.join(out_dir, "eval_v3_radar.png")
