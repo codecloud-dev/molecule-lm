@@ -285,18 +285,22 @@ jobs:
             echo "[eval] 第 $RUNS 轮非评测轮（每 3 轮一次；发版轮必评），跳过以把时间留给训练。"; exit 0
           fi
           echo "[eval] 第 $RUNS 轮执行评测（累计 $HOURS 小时）"
-          timeout 18m python eval_v3.py --out eval_v3_result.json || echo "[eval] 异常跳过"
+          timeout 18m python eval_v3.py --out eval_v3_result.json --detail-out eval_v3_detail.json --stage auto --budget-min 14 --max-new 64 || echo "[eval] 异常跳过"
           python - <<'PY' || true
           import json
           try:
               d = json.load(open('eval_v3_result.json'))
               p = sum(1 for r in d if r['ok'])
               print('评测通过 %d/%d' % (p, len(d)))
+              m = json.load(open('eval_v3_metrics.json'))
+              print('阶段=%s 锚点=%.1f%% 经典公开=%.1f%% 去污染公开=%.1f%% 疑似污染=%.1f%%' % (
+                  m.get('stage'), m.get('acc_anchor', 0), m.get('acc_classic_public', 0),
+                  m.get('acc_clean_public', 0), m.get('contamination_suspect_rate', 0)))
           except Exception as e:
               print('eval status n/a:', e)
           PY
 
-      - name: Upload 评测报告（24 指标 + 雷达图/柱状图/PPL 折线；非评测轮无文件则跳过）
+      - name: Upload 评测报告（原24指标+扩展分层 + 4张图 + 逐题明细；非评测轮无文件则跳过）
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -305,9 +309,12 @@ jobs:
             eval_v3_result.json
             eval_v3_metrics.json
             eval_v3_metrics.md
+            eval_v3_detail.json
+            eval_v3_detail.md
             eval_v3_radar.png
             eval_v3_bars.png
             eval_v3_history.png
+            eval_v3_public.png
           retention-days: 30
           if-no-files-found: ignore
 
@@ -383,22 +390,23 @@ jobs:
           REACHED=$(python3 -c "print(1 if $HOURS>=480 else 0)")
           FORCE=$(python3 -c "print(1 if $HOURS>=720 else 0)")
           if [ "$REACHED" -eq 1 ] || [ "$FORCE" -eq 1 ]; then
-            # 【质量门】时钟到了 != 模型能发。训练崩了（PPL 爆炸 / NaN）也会攒满 20 天，
-            # 那时发出来的是废模型。设计目标 PPL<10，达标才发版。
-            # 拿不到 PPL（checkpoint 缺失/损坏）按【不达标】处理 —— 宁可不发，不发废模型。
-            PPL=$(python3 -c "import math,torch;s=torch.load('checkpoints/v3.pt',map_location='cpu',weights_only=False);p=float(s.get('ppl') or 0.0);print('%.4f'%p if (math.isfinite(p) and p>0) else '999')" 2>/dev/null || echo 999)
-            PPL_OK=$(python -c "print(1 if float('$PPL')<10.0 else 0)")
-            echo "发版质量门：PPL=$PPL（目标 <10）"
-            if [ "$PPL_OK" != "1" ] && [ "$FORCE" != "1" ]; then
-              # 到 20 天但质量未达标，且未撞 30 天硬上限 → 不发版，交由 EXIT trap 继续续训。
-              echo "已达 20 天但 PPL=$PPL 未达 <10，不发版 v3.0（宁缺毋滥），继续续训直到质量达标。"
-              echo "[release] 质量门未过，跳过发版。"
+            # 【多指标质量门】外围脚本，只读不写训练状态。19 项硬门槛 + 5 项联合门槛，
+            # 单独卡 PPL / 锚点 / 阶段 / 两级公开集 / 重复率 / EOS / 安全 / 污染 / 回归 / 延迟。
+            # 防「复读套话刷低 PPL 蒙混发版」；720h 硬上限由脚本内 FORCED 兜底。
+            python3 release_gate.py --clock data/v3_clock.json --ckpt checkpoints/v3.pt \
+              --metrics eval_v3_metrics.json --detail eval_v3_detail.json \
+              --force "$FORCE" --out-json release_gate_report.json --out-md release_gate_report.md
+            GATE_RC=$?
+            if [ "$GATE_RC" -ne 0 ] && [ "$FORCE" != "1" ]; then
+              echo "[release] 多指标质量门未过，跳过发版；续训仍由训练步骤 EXIT trap 负责。"
               exit 0
             fi
-            if [ "$PPL_OK" != "1" ] && [ "$FORCE" = "1" ]; then
-              echo "已撞 30 天硬上限且 PPL=$PPL 仍未 <10，强制发版（标注质量未达标）。"
+            if [ "$GATE_RC" -ne 0 ] && [ "$FORCE" = "1" ]; then
+              echo "[release] 已撞 720h 硬上限，质量门未过但强制发版，notes 中标注未达标。"
             fi
-            echo "发版 v3.0（PPL=$PPL）并停止自动续训。"
+            PPL=$(python3 -c "import json;d=json.load(open('release_gate_report.json'));p=d.get('ppl');print('%.4f'%p if p else '999')" 2>/dev/null || echo 999)
+            FAILED=$(python3 -c "import json;print(','.join(json.load(open('release_gate_report.json')).get('failed_keys',[])))" 2>/dev/null || true)
+            echo "发版 v3.0（PPL=$PPL，未过门槛: ${FAILED:-无}）并停止自动续训。"
             TAG="v3.0"
             for f in molecule-v3-source.gguf molecule-v3.gguf; do
               if [ ! -f "$f" ]; then echo "缺少 $f，跳过发版"; CONTINUE=false; exit 0; fi
@@ -421,18 +429,21 @@ jobs:
               echo
               if [ -f eval_v3_result.json ]; then
                 P=$(python3 -c "import json;d=json.load(open('eval_v3_result.json'));print('%d/%d'%(sum(1 for r in d if r['ok']),len(d)))")
-                echo "评测通过：$P（同口径 20 题，仅趋势监控）"
+                echo "发版卷通过：$P（锚点 + 阶段 + 经典公开集 + 去污染公开卷）"
               fi
               if [ -f eval_v3_metrics.md ]; then
                 echo; cat eval_v3_metrics.md
+              fi
+              if [ -f release_gate_report.md ]; then
+                echo; cat release_gate_report.md
               fi
               if [ -f data/v3_clock.json ]; then
                 C=$(python3 -c "import json;c=json.load(open('data/v3_clock.json'));print('%d 轮 / %.0f 小时 / %.2fB token'%(c.get('runs',0),c.get('total_minutes',0)/60.0,c.get('total_tokens',0)/1e9))")
                 echo "训练累计：$C"
               fi
-              if [ "$PPL_OK" != "1" ]; then
+              if [ -n "${FAILED:-}" ]; then
                 echo
-                echo "⚠️ 质量未达标提示：发版时 PPL=$PPL 未达 <10 目标（30 天硬上限强制发版，v3.0 已可加载使用，后续 v3.1+ 再精炼）。"
+                echo "⚠️ 质量未达标提示：30 天硬上限强制发版，PPL=$PPL，未过门槛：$FAILED（v3.0 已可加载使用，后续 v3.1+ 再精炼）。"
               fi
               if [ -f molecule_rsi_status.md ]; then
                 echo; echo "## 训练调度状态（MetaRSI）"; cat molecule_rsi_status.md
@@ -458,6 +469,9 @@ jobs:
             mkdir -p releases benchmarks
             cp notes.md "releases/${TAG}.md"
             [ -f eval_v3_result.json ] && cp eval_v3_result.json "benchmarks/${TAG}.json"
+            [ -f eval_v3_metrics.json ] && cp eval_v3_metrics.json "benchmarks/${TAG}_metrics.json"
+            [ -f eval_v3_detail.json ] && cp eval_v3_detail.json "benchmarks/${TAG}_detail.json"
+            [ -f release_gate_report.json ] && cp release_gate_report.json "benchmarks/${TAG}_gate.json"
             git config user.email "ci@codecloud.dev"
             git config user.name "molecule CI"
             git add releases benchmarks
@@ -472,3 +486,19 @@ jobs:
           else
             echo "未到 20 天，本轮 GGUF 已导出为产物；续训由训练步骤 EXIT trap 自动触发。"
           fi
+
+      - name: 生成外围总览看板（只读汇总；不碰训练主链路）
+        if: always()
+        run: python3 v3_peripheral_report.py || true
+
+      - name: Upload 发版闸门报告与外围看板（未到发版轮无文件则跳过）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-v3
+          path: |
+            release_gate_report.json
+            release_gate_report.md
+            data/v3_peripheral_dashboard.md
+          retention-days: 30
+          if-no-files-found: ignore
