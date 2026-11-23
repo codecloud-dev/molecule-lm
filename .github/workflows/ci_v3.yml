@@ -323,15 +323,18 @@ jobs:
         continue-on-error: true
         run: |
           python - <<'PY' || true
-          import torch, subprocess
+          import torch, subprocess, math
           try:
               s = torch.load('checkpoints/v3.pt', map_location='cpu', weights_only=False)
               step = s.get('step', 0)
-              loss = s.get('loss', 0.0)
+              ppl = float(s.get('ppl') or 0.0)
+              if not (math.isfinite(ppl) and ppl > 0): ppl = 0.0
           except Exception:
-              step, loss = 0, 0.0
-          subprocess.run(['python', 'metarsi.py', 'update',
-                          '--step', str(step), '--loss', str(round(loss, 4))], check=False)
+              step, ppl = 0, 0.0
+          # checkpoint 的 ppl 是 exp(run_lm) 平滑口径；旧代码用瞬时 loss 会误判发散/最优。
+          cmd = ['python', 'metarsi.py', 'update', '--step', str(step)]
+          cmd += (['--ppl', str(round(ppl, 4))] if ppl > 0 else ['--loss', '0'])
+          subprocess.run(cmd, check=False)
           subprocess.run(['python', 'metarsi.py', 'suggest'], check=False)
           PY
 
